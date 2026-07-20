@@ -1,33 +1,38 @@
 """
-WMT26 quality estimation — Gemini (Google AI Studio API).  [STANDALONE — no other files needed]
+WMT26 quality estimation — Gemini (Google AI Studio API).
 
-LLM-as-judge QE: predicts error spans (start_i, end_i, severity) for MT hypotheses.
-Valid model IDs include: gemini-3.5-flash, gemini-3-flash, gemini-3-pro,
+LLM-as-judge QE using two-stage GEMBA-ESA prompting:
+  Stage 1: Error annotation (domain-specific prompt → text annotations)
+  Stage 2: Scoring (annotation + source/hyp → 0-100 score)
+Output fields: stage1_annotations, predicted_errors (char spans), score.
+
+This file is self-contained — no other project files are required.
+
+Valid model IDs include: gemini-3-flash-preview, gemini-3-pro-preview,
 gemini-2.5-flash, gemini-2.5-pro. Change MODEL_ID below as needed.
-Setup: pip install -U google-genai ; export GEMINI_API_KEY="..."
-Run:   python run_qe.py [--test]
+
+Setup:
+  pip install -U google-genai
+  export GEMINI_API_KEY="your_key_here"
+
+Run (after extracting the data tarball next to this script):
+  python run_qe.py --test          # test on one segment, no file written
+  python run_qe.py                 # full run, all language pairs
+  python run_qe.py --pair en-de    # single pair
+  python run_qe.py --resume        # resume an interrupted run
 """
 
 import argparse
+import json
+import logging
 import os
 import re
 import sys
 import time
-import logging
 from pathlib import Path
 
 from google import genai
 from google.genai import types
-
-from qe_utils import (
-    HUMEVAL_FILE,
-    TARGET_PAIRS,
-    load_instances,
-    build_qe_prompt,
-    parse_qe_output,
-    make_row,
-    save_jsonl,
-)
 
 
 # ============================================================================
@@ -38,9 +43,358 @@ MODEL_ID = "gemini-3-flash-preview"
 OUTPUT_NAME = MODEL_ID
 OUTPUT_DIR = Path("quality_estimation_outputs_gemini")
 
-MIN_INTERVAL_SEC = 6.5    # ~10 req/min free tier; set 0 to disable
+THINKING_LEVEL = "medium"   # "low" / "medium" / "high" for Gemini 3.x; "none" to disable
+
+MIN_INTERVAL_SEC = 0        # 0 = disabled (for enterprise/internal API access)
+                            # set to 6.5 for free-tier (~10 req/min rate limit)
 MAX_RETRIES = 6
 MAX_BACKOFF_SEC = 120
+
+
+# ============================================================================
+# GEMBA-ESA PROMPTS  (embedded from qe_utils.py)
+# ============================================================================
+
+SYSTEM_PROMPT = "Your task is to identify machine translation errors and assess the quality of the translation."
+
+# Domain requirement text inserted into Stage 1 and Stage 2 prompts.
+# Keys match the domain component of item_id (3rd _###_ field).
+DOMAIN_REQUIREMENTS = {
+    "news": (
+        "The source segment is from a news article. The translation should use a formal "
+        "register consistent with journalistic standards and preserve the source HTML formatting."
+    ),
+    "factchecking": (
+        "The source segment is from a news article. The translation should use a formal "
+        "register consistent with journalistic standards and preserve the source HTML formatting."
+    ),
+    "speech": (
+        "The source segment is a transcript of spoken content from a video. The translation "
+        "should preserve the speaker's flow and colloquial style. It should omit non-linguistic "
+        "sounds, such as laughter, groans, and hesitation sounds, while retaining interjections. "
+        "Interrupted words should be completed when they can be inferred from context; otherwise, "
+        "they should be omitted. Foreign words should remain unchanged. Each sentence should be "
+        "placed on a separate line."
+    ),
+    "social": (
+        "The source segment is user-generated content from a social media platform. Source "
+        "spelling mistakes should not be reproduced. Meaningful expressiveness, such as "
+        "capitalization or elongation, should be reproduced naturally in the target language. "
+        "URLs and user handles should be copied unchanged, while hashtags should be translated "
+        "when appropriate. Source punctuation should be followed as closely as possible, with "
+        "additional punctuation only when needed to prevent serious loss of comprehension. The "
+        "translation should use an informal style, like close friends talking, even if this "
+        "changes the original tone, and preserve the source HTML formatting."
+    ),
+    "software": (
+        "The source segment contains software data from a JSON. Only JSON content or values "
+        "should be translated; keys and placeholders should be copied unchanged. The translation "
+        "should contain only valid JSON content matching the input format."
+    ),
+    "edu": (
+        "The source segment consists of biology, chemistry, and geography exercises from an "
+        "educational web portal for children aged 9-16. The translation should be suitable for "
+        "this educational context and age range, and preserve the source HTML formatting."
+    ),
+}
+
+_STAGE1_ANNOTATION_BODY = (
+    "Based on the source segment and machine translation surrounded by triple backticks, "
+    "identify error types in the translation and classify them. The categories of errors are: "
+    "accuracy (addition, mistranslation, omission, untranslated text), fluency (character "
+    "encoding, grammar, inconsistency, punctuation, register, spelling), style (awkward), "
+    "terminology (inappropriate for context, inconsistent use), non-translation, other, or "
+    "no-error.\n\n\n"
+    "Each error is classified as one of two categories: major or minor. Major errors disrupt "
+    "the flow and make the understandability of the text difficult or impossible. Minor errors "
+    "are errors that do not disrupt the flow significantly, and what the text is trying to say "
+    "is still understandable.\n\n\n"
+    "Return only the annotations in this format:\n"
+    "Major:\n"
+    "category/subcategory - \"error span\"\n"
+    "Minor:\n"
+    "category/subcategory - \"error span\"\n\n\n"
+    "Use one error per line and write no-error when a section is empty. Quote spans from the "
+    "translation; for omissions, quote the omitted source span."
+)
+
+_STAGE2_SCORING_BODY = (
+    "Given the translation from {src_name} to {tgt_name} and the annotated error spans, assign "
+    "a score on a continuous scale from 0 to 100. The scale has the following reference points: "
+    "0=\"No meaning preserved\", 33=\"Some meaning preserved\", 66=\"Most meaning preserved and "
+    "few grammar mistakes\", up to 100=\"Perfect meaning and grammar\".\n\n\n"
+    "Domain requirements: {domain_req}\n\n\n"
+    "Score the following translation:\n"
+    "{src_name} source:\n"
+    "```{src_text}```\n"
+    "{tgt_name} translation:\n"
+    "```{hyp_text}```\n"
+    "Annotated error spans:\n"
+    "```{error_spans}```\n\n\n"
+    "Respond with ONLY a valid JSON object and nothing else: {{\"score\": N}}\n"
+    "where N is an integer from 0 to 100."
+)
+
+# Language pairs for the WMT26 QE task (21 of 23 released).
+# Keys match data filenames (e.g. "en-de" -> en-de.json).
+# src_code/tgt_code are the FLORES-200 codes from item_id fields.
+TARGET_PAIRS = {
+    "cs-de":   {"src_name": "Czech",              "tgt_name": "German",              "src_code": "ces_Latn", "tgt_code": "deu_Latn"},
+    "cs-vi":   {"src_name": "Czech",              "tgt_name": "Vietnamese",          "src_code": "ces_Latn", "tgt_code": "vie_Latn"},
+    "en-areg": {"src_name": "English",            "tgt_name": "Egyptian Arabic",     "src_code": "eng_Latn", "tgt_code": "arz_Arab"},
+    "en-be":   {"src_name": "English",            "tgt_name": "Belarusian",          "src_code": "eng_Latn", "tgt_code": "bel_Cyrl"},
+    "en-cs":   {"src_name": "English",            "tgt_name": "Czech",               "src_code": "eng_Latn", "tgt_code": "ces_Latn"},
+    "en-de":   {"src_name": "English",            "tgt_name": "German",              "src_code": "eng_Latn", "tgt_code": "deu_Latn"},
+    "en-et":   {"src_name": "English",            "tgt_name": "Estonian",            "src_code": "eng_Latn", "tgt_code": "ekk_Latn"},
+    "en-hy":   {"src_name": "English",            "tgt_name": "Armenian",            "src_code": "eng_Latn", "tgt_code": "hye_Armn"},
+    "en-id":   {"src_name": "English",            "tgt_name": "Indonesian",          "src_code": "eng_Latn", "tgt_code": "ind_Latn"},
+    "en-is":   {"src_name": "English",            "tgt_name": "Icelandic",           "src_code": "eng_Latn", "tgt_code": "isl_Latn"},
+    "en-ja":   {"src_name": "English",            "tgt_name": "Japanese",            "src_code": "eng_Latn", "tgt_code": "jpn_Jpan"},
+    "en-kk":   {"src_name": "English",            "tgt_name": "Kazakh",              "src_code": "eng_Latn", "tgt_code": "kaz_Cyrl"},
+    "en-ko":   {"src_name": "English",            "tgt_name": "Korean",              "src_code": "eng_Latn", "tgt_code": "kor_Hang"},
+    "en-lij":  {"src_name": "English",            "tgt_name": "Ligurian",            "src_code": "eng_Latn", "tgt_code": "lij_Latn"},
+    "en-lld":  {"src_name": "English",            "tgt_name": "Ladin",               "src_code": "eng_Latn", "tgt_code": "lld_Latn"},
+    "en-ru":   {"src_name": "English",            "tgt_name": "Russian",             "src_code": "eng_Latn", "tgt_code": "rus_Cyrl"},
+    "en-th":   {"src_name": "English",            "tgt_name": "Thai",                "src_code": "eng_Latn", "tgt_code": "tha_Thai"},
+    "en-uk":   {"src_name": "English",            "tgt_name": "Ukrainian",           "src_code": "eng_Latn", "tgt_code": "ukr_Cyrl"},
+    "en-zhcn": {"src_name": "English",            "tgt_name": "Simplified Chinese",  "src_code": "eng_Latn", "tgt_code": "zho_Hans"},
+    "en-zhtw": {"src_name": "English",            "tgt_name": "Traditional Chinese", "src_code": "eng_Latn", "tgt_code": "zho_Hant_TW"},
+    "zhcn-ja": {"src_name": "Simplified Chinese", "tgt_name": "Japanese",            "src_code": "zho_Hans", "tgt_code": "jpn_Jpan"},
+}
+
+HYP_SYSTEM = "Gemini 3.1 Pro"  # reference system name; all hyps are evaluated in full runs
+N_INSTANCES_PER_PAIR = None     # None = all segments (no cap)
+
+
+# ============================================================================
+# DATA LOADING
+# ============================================================================
+
+def get_domain(item_id: str) -> str:
+    """Extract domain from item_id (3rd _###_ component). Falls back to 'news'."""
+    parts = tuple(item_id.split("_###_"))
+    domain = parts[2] if len(parts) > 2 else "news"
+    if domain not in DOMAIN_REQUIREMENTS:
+        logging.warning("Unknown domain %r in item_id %r — falling back to 'news'", domain, item_id)
+        return "news"
+    return domain
+
+
+def load_instances(data_dir=None, target_pairs=None):
+    """Load QE instances from per-pair JSONL files under data_dir.
+
+    Each file is named '{pair}.json' (e.g. 'en-de.json') and is actually JSONL.
+    Returns a dict mapping lang-pair key -> list of instance dicts, each with:
+      doc_id, src_text, hyp_text, refA, _raw (original JSON dict)
+    """
+    data_dir = Path(data_dir) if data_dir else Path(".")
+    target_pairs = target_pairs or TARGET_PAIRS
+
+    buckets = {pair: [] for pair in target_pairs}
+    for pair in target_pairs:
+        fpath = data_dir / f"{pair}.json"
+        with open(fpath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if N_INSTANCES_PER_PAIR is not None and len(buckets[pair]) >= N_INSTANCES_PER_PAIR:
+                    break
+                d = json.loads(line)
+                buckets[pair].append({
+                    "doc_id": d["item_id"],
+                    "src_text": d.get("src", ""),
+                    "hyp_text": d.get("hyps", {}).get(HYP_SYSTEM, ""),
+                    "refA": d.get("ref", {}).get("text"),
+                    "_raw": d,
+                })
+    return buckets
+
+
+# ============================================================================
+# PROMPT BUILDERS
+# ============================================================================
+
+def build_stage1_prompt(src_text: str, hyp_text: str, cfg: dict, domain: str) -> str:
+    src_name = cfg["src_name"]
+    tgt_name = cfg["tgt_name"]
+    domain_req = DOMAIN_REQUIREMENTS[domain]
+    return (
+        f"{src_name} source:\n"
+        f"```{src_text}```\n"
+        f"{tgt_name} translation:\n"
+        f"```{hyp_text}```\n\n\n"
+        f"{_STAGE1_ANNOTATION_BODY}\n\n\n"
+        f"Domain requirements: {domain_req}"
+    )
+
+
+def build_stage2_prompt(src_text, hyp_text, stage1_output, cfg, domain):
+    return _STAGE2_SCORING_BODY.format(
+        src_name=cfg["src_name"],
+        tgt_name=cfg["tgt_name"],
+        domain_req=DOMAIN_REQUIREMENTS[domain],
+        src_text=src_text,
+        hyp_text=hyp_text,
+        error_spans=stage1_output,
+    )
+
+
+# ============================================================================
+# OUTPUT PARSING
+# ============================================================================
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>…</think> blocks."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def parse_stage1_output(text: str) -> str:
+    return _strip_thinking(text) if text else ""
+
+
+_SPAN_RE = re.compile(r'^(\S[^"]*?)\s*-\s*"([^"]*)"')
+
+
+def _find_span(span: str, hyp_text: str) -> tuple:
+    idx = hyp_text.find(span)
+    if idx != -1:
+        return idx, idx + len(span)
+    stripped = span.rstrip("\\")
+    if stripped and stripped != span:
+        idx = hyp_text.find(stripped)
+        if idx != -1:
+            return idx, idx + len(stripped)
+    span_ws = re.sub(r"\s+", " ", span).strip()
+    hyp_ws = re.sub(r"\s+", " ", hyp_text)
+    if span_ws:
+        idx = hyp_ws.find(span_ws)
+        if idx != -1:
+            return idx, idx + len(span_ws)
+    return -1, -1
+
+
+def stage1_to_predicted_errors(stage1_text: str, hyp_text: str) -> dict:
+    """Convert Stage 1 annotation text to the task1_pred format for one system.
+
+    Returns:
+      {
+        "errors": [{"start": int, "end": int, "severity": str, "category": str}],
+        "omission": None | "minor" | "major",
+        "instruction_fault": None,
+      }
+    Indices are half-open [start, end) matching Python slice conventions.
+    omission is derived from accuracy/omission annotations (the omitted text is
+    not in the hypothesis so no span is recorded). instruction_fault is always
+    null as the current prompt is not designed to detect it.
+    """
+    errors = []
+    omission_severities = []
+    current_severity = None
+
+    for line in stage1_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.lower() == "major:":
+            current_severity = "major"
+        elif line.lower() == "minor:":
+            current_severity = "minor"
+        elif current_severity and line.lower() != "no-error":
+            m = _SPAN_RE.match(line)
+            if m:
+                category = m.group(1).strip()
+                span = m.group(2)
+                cat_lower = category.lower()
+                if "omission" in cat_lower and cat_lower.startswith("accuracy"):
+                    omission_severities.append(current_severity)
+                else:
+                    start, end = _find_span(span, hyp_text)
+                    if start != -1:
+                        errors.append({"start": start, "end": end,
+                                       "severity": current_severity, "category": category})
+                    else:
+                        logging.warning("Span not found in hyp_text: %r | hyp: %r", span, hyp_text[:120])
+
+    def _max_sev(sevs):
+        if "major" in sevs:
+            return "major"
+        if "minor" in sevs:
+            return "minor"
+        return None
+
+    return {
+        "errors": errors,
+        "omission": _max_sev(omission_severities),
+        "instruction_fault": None,
+    }
+
+
+def parse_stage2_output(text: str):
+    if not text:
+        return None
+    text = _strip_thinking(text).strip()
+    stripped = re.sub(r"^```[a-zA-Z]*\s*", "", text).strip()
+    stripped = re.sub(r"\s*```\s*$", "", stripped).strip()
+    try:
+        obj = json.loads(stripped)
+        val = float(obj["score"])
+        if 0.0 <= val <= 100.0:
+            return val
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        pass
+    matches = re.findall(r"\b(\d+(?:\.\d+)?)\b", text)
+    for m in reversed(matches):
+        try:
+            val = float(m)
+            if 0.0 <= val <= 100.0:
+                return val
+        except ValueError:
+            pass
+    logging.warning("Failed to parse score from Stage 2 output: %s", text[:200])
+    return None
+
+
+# ============================================================================
+# OUTPUT HELPERS
+# ============================================================================
+
+def make_row(inst, task1_pred: dict, task2_pred: dict) -> dict:
+    """Return the WMT26 QE submission row.
+
+    task1_pred maps system_name -> {errors, omission, instruction_fault}.
+    task2_pred maps system_name -> score (float or None).
+    """
+    return {
+        "item_id": inst["doc_id"],
+        "task1_pred": task1_pred,
+        "task2_pred": task2_pred,
+    }
+
+
+def append_row(row: dict, path) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def load_done_ids(path) -> set:
+    done = set()
+    path = Path(path)
+    if not path.exists():
+        return done
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                t2 = obj.get("task2_pred", {})
+                if any(v is not None for v in t2.values()):
+                    done.add(obj.get("item_id"))
+            except json.JSONDecodeError:
+                pass
+    return done
 
 
 # ============================================================================
@@ -62,14 +416,8 @@ def is_rate_limit(exc):
 
 
 def is_daily_quota_exhausted(exc):
-    """
-    Distinguish a per-DAY quota exhaustion from a transient per-minute rate limit.
-    Per-day errors mention 'PerDay' / 'per day' in the quota metric and won't
-    recover by waiting a minute, so we should stop rather than burn retries.
-    """
     msg = str(exc).lower()
-    return is_rate_limit(exc) and ("perday" in msg or "per day" in msg
-                                   or "daily" in msg)
+    return is_rate_limit(exc) and ("perday" in msg or "per day" in msg or "daily" in msg)
 
 
 # ============================================================================
@@ -79,7 +427,13 @@ def is_daily_quota_exhausted(exc):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", action="store_true",
-                        help="Run on one segment only (prints prompt+response, no file written)")
+                        help="Run one segment of one system (prints prompts+responses, no file written)")
+    parser.add_argument("--pair", default=None,
+                        help="Process only this language pair (e.g. en-de).")
+    parser.add_argument("--data-dir", default=None,
+                        help="Directory containing the .json data files (default: same directory as this script).")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip segments already present in the output file.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -93,15 +447,20 @@ def main():
 
     def _build_config():
         """
-        Build a generation config that disables thinking. Gemini 2.5 uses
-        thinking_budget=0; Gemini 3.x uses thinking_level='minimal'. We try the
-        most specific first and fall back so the script works across families.
+        Build a generation config with thinking enabled at THINKING_LEVEL.
+        Gemini 3.x uses thinking_level; Gemini 2.5 uses thinking_budget.
+        We try the most specific first and fall back so the script works
+        across model families.
         """
-        base = dict(temperature=0.0, max_output_tokens=4096)
+        base = dict(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.0,
+            max_output_tokens=8192,
+        )
         for tc in (
-            lambda: types.ThinkingConfig(thinking_level="minimal"),
-            lambda: types.ThinkingConfig(thinking_budget=0),
-            lambda: None,
+            lambda: types.ThinkingConfig(thinking_level=THINKING_LEVEL),  # Gemini 3.x
+            lambda: types.ThinkingConfig(thinking_budget=1024),            # Gemini 2.5 fallback
+            lambda: None,                                                   # no thinking config
         ):
             try:
                 cfg_obj = tc()
@@ -140,67 +499,118 @@ def main():
                 time.sleep(wait)
         raise RuntimeError("All retries failed")
 
-    instances_by_pair = load_instances()
+    # Determine active pairs
+    if args.pair is not None:
+        if args.pair not in TARGET_PAIRS:
+            sys.exit(f"Unknown pair {args.pair!r}. Valid pairs: {list(TARGET_PAIRS)}")
+        active_pairs = {args.pair: TARGET_PAIRS[args.pair]}
+    else:
+        active_pairs = TARGET_PAIRS
+
+    instances_by_pair = load_instances(data_dir=args.data_dir, target_pairs=active_pairs)
 
     if args.test:
-        # Single-segment smoke test: first instance of first pair, no file written.
-        import json
-        pair = next(iter(TARGET_PAIRS))
-        cfg = TARGET_PAIRS[pair]
+        pair = next(iter(active_pairs))
+        cfg = active_pairs[pair]
         instances = instances_by_pair.get(pair, [])
         if not instances:
             sys.exit(f"No instances found for {pair}")
         inst = instances[0]
-        prompt = build_qe_prompt(inst["src_text"], inst["hyp_text"], cfg)
+        hyps = inst["_raw"].get("hyps", {})
+        if not hyps:
+            sys.exit("No hypotheses found in first instance")
+        test_system, hyp = next(iter(hyps.items()))
+        src = inst["src_text"]
+        domain = get_domain(inst["doc_id"])
+
+        prompt1 = build_stage1_prompt(src, hyp, cfg, domain)
         print("=" * 60)
-        print("PROMPT:")
-        print(prompt)
+        print(f"PAIR: {pair} | DOMAIN: {domain} | SYSTEM: {test_system}")
+        print("STAGE 1 PROMPT:")
+        print(prompt1)
         print("=" * 60)
-        raw = call_api_with_retries(prompt)
-        print("RAW RESPONSE:")
-        print(raw)
+        raw1 = call_api_with_retries(prompt1)
+        print("STAGE 1 RESPONSE:")
+        print(raw1)
         print("=" * 60)
-        errors = parse_qe_output(raw)
-        print("PARSED predicted_errors:")
-        print(json.dumps(errors, indent=2, ensure_ascii=False))
+        stage1_text = parse_stage1_output(raw1)
+        parsed = stage1_to_predicted_errors(stage1_text, hyp)
+
+        prompt2 = build_stage2_prompt(src, hyp, stage1_text, cfg, domain)
+        print("STAGE 2 PROMPT:")
+        print(prompt2)
+        print("=" * 60)
+        raw2 = call_api_with_retries(prompt2)
+        print("STAGE 2 RESPONSE:")
+        print(raw2)
+        print("=" * 60)
+        score = parse_stage2_output(raw2)
+        print("PARSED task1 result:")
+        print(json.dumps(parsed, indent=2, ensure_ascii=False))
+        print(f"SCORE: {score}")
         return
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = OUTPUT_DIR / f"pred_{OUTPUT_NAME}_{HUMEVAL_FILE.name}"
 
-    rows = []
+    def _rate_limited_call(prompt):
+        nonlocal last_call
+        if MIN_INTERVAL_SEC > 0:
+            elapsed = time.time() - last_call
+            if elapsed < MIN_INTERVAL_SEC:
+                time.sleep(MIN_INTERVAL_SEC - elapsed)
+        result = call_api_with_retries(prompt)
+        last_call = time.time()
+        return result
+
     last_call = 0.0
-    for pair, cfg in TARGET_PAIRS.items():
+    for pair, cfg in active_pairs.items():
+        output_path = OUTPUT_DIR / f"pred_{OUTPUT_NAME}_{pair}.jsonl"
         instances = instances_by_pair.get(pair, [])
-        logging.info(f"[{pair}] running QE on {len(instances)} segments")
-        for inst in instances:
-            if MIN_INTERVAL_SEC > 0:
-                elapsed = time.time() - last_call
-                if elapsed < MIN_INTERVAL_SEC:
-                    time.sleep(MIN_INTERVAL_SEC - elapsed)
-            prompt = build_qe_prompt(inst["src_text"], inst["hyp_text"], cfg)
-            try:
-                raw = call_api_with_retries(prompt)
-                predicted_errors = parse_qe_output(raw)
-            except DailyQuotaExhausted as e:
-                save_jsonl(rows, output_path)
-                logging.error(
-                    f"DAILY QUOTA EXHAUSTED at [{pair}] {inst['doc_id']}. "
-                    f"Saved {len(rows)} completed rows. Stopping.\n"
-                    f"  -> Resume tomorrow, or enable billing on the API key, or "
-                    f"switch MODEL_ID to a model with a higher free-tier daily limit.\n"
-                    f"  -> To resume without redoing finished pairs, comment them out "
-                    f"in TARGET_PAIRS in qe_utils.py.\n  Detail: {e}"
-                )
-                sys.exit(1)
-            except Exception as e:
-                logging.error(f"[{pair}] {inst['doc_id']} failed: {e}")
-                predicted_errors = []
-            finally:
-                last_call = time.time()
-            rows.append(make_row(inst, predicted_errors))
-        save_jsonl(rows, output_path)
-        logging.info(f"[{pair}] persisted — {len(rows)} rows total")
+
+        done_ids = load_done_ids(output_path) if args.resume else set()
+        todo = [inst for inst in instances if inst["doc_id"] not in done_ids]
+        logging.info(f"[{pair}] {len(todo)}/{len(instances)} segments to process "
+                     f"(2 API calls × N systems each) → {output_path.name}")
+
+        for seg_i, inst in enumerate(todo):
+            src = inst["src_text"]
+            domain = get_domain(inst["doc_id"])
+            hyps = inst["_raw"].get("hyps", {})
+            task1_results = {}
+            task2_results = {}
+
+            for system, hyp in hyps.items():
+                if not hyp:
+                    continue
+                try:
+                    raw1 = _rate_limited_call(build_stage1_prompt(src, hyp, cfg, domain))
+                    stage1_text = parse_stage1_output(raw1)
+                    parsed = stage1_to_predicted_errors(stage1_text, hyp)
+                    raw2 = _rate_limited_call(build_stage2_prompt(src, hyp, stage1_text, cfg, domain))
+                    score = parse_stage2_output(raw2)
+                    task1_results[system] = {
+                        "errors": parsed["errors"],
+                        "omission": parsed["omission"],
+                        "instruction_fault": parsed["instruction_fault"],
+                    }
+                    task2_results[system] = score
+                except DailyQuotaExhausted as e:
+                    append_row(make_row(inst, task1_results, task2_results), output_path)
+                    logging.error(
+                        f"DAILY QUOTA EXHAUSTED at [{pair}] {inst['doc_id']} | {system}. "
+                        f"Partial segment saved. Resume with --resume tomorrow.\n  Detail: {e}"
+                    )
+                    sys.exit(1)
+                except Exception as e:
+                    logging.error(f"[{pair}] {inst['doc_id']} | {system} failed: {e}")
+                    task1_results[system] = {"errors": [], "omission": None, "instruction_fault": None}
+                    task2_results[system] = None
+
+            append_row(make_row(inst, task1_results, task2_results), output_path)
+            if (seg_i + 1) % 10 == 0:
+                logging.info(f"[{pair}] {seg_i + 1}/{len(todo)} segments done")
+
+        logging.info(f"[{pair}] complete → {output_path.name}")
     logging.info("Done.")
 
 
