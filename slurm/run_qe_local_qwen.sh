@@ -1,35 +1,36 @@
 #!/bin/bash --login
 # ============================================================================
-# WMT26 QE baseline — local open-weight models (Gemma-4 / Qwen3.6)
-# Job array: one H200 per language pair (21 jobs total).
+# WMT26 QE baseline — Qwen3.6-35B-A3B on A100s
+# Job array: one node per language pair (21 jobs total).
 #
-# GPU memory guidance:
-#   gemma4  (google/gemma-4-31B-it, ~62 GB bf16):  1× H200 (141 GB SXM)
-#   qwen36  (Qwen/Qwen3.6-35B-A3B, ~70 GB bf16):   1× H200 (141 GB SXM)
+# GPU memory guidance (BF16 weights ~70 GB):
+#   2× A100 80GB  — fits comfortably, throughput ≈ 1× H200
+#   4× A100 80GB  — more KV cache headroom, throughput > H200; use --batch-size 32
 #
 # Edit the Configuration block below, then:
-#   sbatch slurm/run_qe_local.sh
+#   sbatch slurm/run_qe_local_qwen.sh
 # To run a single pair (e.g. for testing):
-#   sbatch --array=0 slurm/run_qe_local.sh
+#   sbatch --array=0 slurm/run_qe_local_qwen.sh
 # ============================================================================
 
-#SBATCH --time=24:00:00
-#SBATCH --job-name=qe_local
+#SBATCH --time=72:00:00
+#SBATCH --job-name=qe_qwen
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:b200:1
-#SBATCH --mem=256G
+#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:a100:4
+#SBATCH --mem=1T
 #SBATCH --array=0-20
-#SBATCH --qos=cs
+#SBATCH --qos=matrix
 #SBATCH --output=slurm/logs/%x_%A_%a.out
 #SBATCH --error=slurm/logs/%x_%A_%a.err
 #SBATCH --exclude=dw-2-4
 
 # ── Configuration (edit as needed) ─────────────────────────────────────────
-MODEL="gemma4"           # gemma4 | qwen36
+MODEL="qwen36"           # gemma4 | qwen36
 THINKING=false           # true | false
 MAX_NEW_TOKENS=512       # Stage 1 token budget; recommend 8192+ when THINKING=true
+BATCH_SIZE=32            # 16 for 2× A100; 32 for 4× A100; 2 when THINKING=true
 # ───────────────────────────────────────────────────────────────────────────
 
 # Language pairs — must match TARGET_PAIRS keys in qe_utils.py (21 pairs).
@@ -76,4 +77,4 @@ python run_qe_local.py \
     --max-new-tokens "$MAX_NEW_TOKENS" \
     --pair "$PAIR" \
     --resume \
-    --batch-size 16
+    --batch-size "$BATCH_SIZE"
