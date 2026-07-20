@@ -75,7 +75,7 @@ The system prompt for both stages is: *"Your task is to identify machine transla
 
 ### All systems evaluated
 
-Every MT system hypothesis in the `hyps` field is evaluated independently. Results are stored together per segment in a `qe_results` dict keyed by system name.
+Every MT system hypothesis in the `hyps` field is evaluated independently. Results are stored together per segment in `task1_pred` and `task2_pred` dicts keyed by system name.
 
 ### Per-segment checkpointing
 
@@ -106,31 +106,37 @@ The `item_id` encodes source language, target language, domain, document ID, and
 
 ## Output format
 
-Each input segment is written to the output JSONL with a `qe_results` field added:
+Each input segment produces one JSONL line with `task1_pred` (error spans per system) and `task2_pred` (quality scores per system):
 
 ```json
 {
-  "item_id": "...",
-  "src": "...",
-  "ref": {...},
-  "hyps": {...},
-  "qe_results": {
+  "item_id": "eng_Latn_###_deu_Latn_###_speech_###_id_rtWATtjAFUM_29.58-58.15_###_0",
+  "task1_pred": {
     "Gemini 3.1 Pro": {
-      "stage1_annotations": "Major:\naccuracy/mistranslation - \"wrong word\"\nMinor:\nno-error",
-      "predicted_errors": [{"start_i": 5, "end_i": 14, "severity": "major"}],
-      "score": 72.0
+      "errors": [
+        {"start": 197, "end": 202, "severity": "major", "category": "accuracy/addition"}
+      ],
+      "omission": null,
+      "instruction_fault": null
     },
     "Gemma 4 - 31B": {
-      "stage1_annotations": "...",
-      "predicted_errors": [...],
-      "score": 85.0
+      "errors": [
+        {"start": 171, "end": 177, "severity": "minor", "category": "fluency/register"}
+      ],
+      "omission": "minor",
+      "instruction_fault": null
     },
+    ...
+  },
+  "task2_pred": {
+    "Gemini 3.1 Pro": 60.0,
+    "Gemma 4 - 31B": 75.0,
     ...
   }
 }
 ```
 
-`predicted_errors` contains character-level span indices derived by string-matching the quoted error spans from Stage 1 back into the hypothesis text.
+`errors` contains character-level span indices (half-open `[start, end)`) derived by string-matching the quoted error spans from Stage 1 back into the hypothesis text. `omission` is set to `"major"` or `"minor"` when Stage 1 identifies an `accuracy/omission` error (omitted content has no span in the hypothesis). `instruction_fault` is always `null` (not detectable from the current prompt).
 
 ---
 
@@ -179,7 +185,7 @@ python run_qe_local.py --model qwen36 --thinking --max-new-tokens 8192
 
 Output is written to `quality_estimation_outputs_local/pred_{model}_{pair}.jsonl`.
 
-**Token budgets:** Stage 1 (error annotation) uses `--max-new-tokens` (default 512). Stage 2 (scoring) always uses a fixed budget of 32 tokens since it only outputs a number.
+**Token budgets:** Stage 1 (error annotation) uses `--max-new-tokens` (default 512). Stage 2 (scoring) always uses a fixed budget of 64 tokens since it only outputs a number.
 
 GPU memory (bf16):
 - `gemma4` (~62 GB): 1× H200 / A100-80G / H100-80G
@@ -223,7 +229,7 @@ Key settings in `run_qe_local.py`:
 |---|---|---|
 | `DEFAULT_MAX_NEW_TOKENS` | `512` | Stage 1 token budget without thinking |
 | `DEFAULT_MAX_NEW_TOKENS_THINKING` | `8192` | Stage 1 token budget with `--thinking` |
-| `MAX_NEW_TOKENS_STAGE2` | `32` | Stage 2 token budget (hardcoded; just a number) |
+| `MAX_NEW_TOKENS_STAGE2` | `64` | Stage 2 token budget (hardcoded; just a number) |
 
 ---
 
