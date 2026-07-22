@@ -105,11 +105,12 @@ _STAGE2_SCORING_BODY = (
     "where N is an integer from 0 to 100."
 )
 
-# Language pairs for the WMT26 QE task (21 of 23 released).
-# Keys match data filenames (e.g. "en-de" -> ../data/en-de.json).
+# Language pairs for the WMT26 QE task (23 pairs).
+# Keys match data filenames (e.g. "en-de" -> ../data/en-de.jsonl).
 # src_code/tgt_code are the FLORES-200 codes from item_id fields.
 TARGET_PAIRS = {
     "cs-de":   {"src_name": "Czech",              "tgt_name": "German",              "src_code": "ces_Latn", "tgt_code": "deu_Latn"},
+    "cs-uk":   {"src_name": "Czech",              "tgt_name": "Ukrainian",           "src_code": "ces_Latn", "tgt_code": "ukr_Cyrl"},
     "cs-vi":   {"src_name": "Czech",              "tgt_name": "Vietnamese",          "src_code": "ces_Latn", "tgt_code": "vie_Latn"},
     "en-areg": {"src_name": "English",            "tgt_name": "Egyptian Arabic",     "src_code": "eng_Latn", "tgt_code": "arz_Arab"},
     "en-be":   {"src_name": "English",            "tgt_name": "Belarusian",          "src_code": "eng_Latn", "tgt_code": "bel_Cyrl"},
@@ -125,6 +126,7 @@ TARGET_PAIRS = {
     "en-lij":  {"src_name": "English",            "tgt_name": "Ligurian",            "src_code": "eng_Latn", "tgt_code": "lij_Latn"},
     "en-lld":  {"src_name": "English",            "tgt_name": "Ladin",               "src_code": "eng_Latn", "tgt_code": "lld_Latn"},
     "en-ru":   {"src_name": "English",            "tgt_name": "Russian",             "src_code": "eng_Latn", "tgt_code": "rus_Cyrl"},
+    "en-se":   {"src_name": "English",            "tgt_name": "Northern Sámi",       "src_code": "eng_Latn", "tgt_code": "sme_Latn"},
     "en-th":   {"src_name": "English",            "tgt_name": "Thai",                "src_code": "eng_Latn", "tgt_code": "tha_Thai"},
     "en-uk":   {"src_name": "English",            "tgt_name": "Ukrainian",           "src_code": "eng_Latn", "tgt_code": "ukr_Cyrl"},
     "en-zhcn": {"src_name": "English",            "tgt_name": "Simplified Chinese",  "src_code": "eng_Latn", "tgt_code": "zho_Hans"},
@@ -164,7 +166,7 @@ def load_instances(
 ):
     """Load QE instances from per-pair JSONL files under data_dir.
 
-    Each file is named '{pair}.json' (e.g. 'en-de.json') and is actually JSONL.
+    Each file is named '{pair}.jsonl' (e.g. 'en-de.jsonl').
     New field mapping vs. old humeval format:
       item_id -> doc_id  |  src -> src_text  |  hyps[system] -> hyp_text
       ref.text -> refA
@@ -179,7 +181,7 @@ def load_instances(
 
     buckets = {pair: [] for pair in target_pairs}
     for pair in target_pairs:
-        fpath = data_dir / f"{pair}.json"
+        fpath = data_dir / f"{pair}.jsonl"
         with open(fpath, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -266,6 +268,8 @@ def _find_span(span: str, hyp_text: str) -> tuple:
 
     Returns (start, end) on success, or (-1, -1) if not found.
     """
+    if not span:  # empty string would always "match" at index 0 in Python
+        return -1, -1
     idx = hyp_text.find(span)
     if idx != -1:
         return idx, idx + len(span)
@@ -402,6 +406,51 @@ def append_row(row: dict, path) -> None:
     """Append a single row to a JSONL file (creates file if needed)."""
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def load_done_rows(path) -> dict:
+    """Return dict mapping item_id -> merged row from a JSONL output file.
+
+    When an item_id appears multiple times (e.g. from a crash-then-resume cycle),
+    rows are merged at the system level: for each system, the latest non-null
+    task2 score wins and the corresponding task1 result is kept alongside it.
+    """
+    rows: dict = {}
+    path = Path(path)
+    if not path.exists():
+        return rows
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                iid = obj.get("item_id")
+                if iid is None:
+                    continue
+                if iid not in rows:
+                    rows[iid] = {
+                        "item_id": iid,
+                        "task1_pred": dict(obj.get("task1_pred", {})),
+                        "task2_pred": dict(obj.get("task2_pred", {})),
+                    }
+                else:
+                    prev = rows[iid]
+                    for sys, score in obj.get("task2_pred", {}).items():
+                        if score is not None:
+                            prev["task2_pred"][sys] = score
+                            t1 = obj.get("task1_pred", {}).get(sys)
+                            if t1 is not None:
+                                prev["task1_pred"][sys] = t1
+                        elif sys not in prev["task2_pred"]:
+                            prev["task2_pred"][sys] = None
+                            t1 = obj.get("task1_pred", {}).get(sys)
+                            if t1 is not None:
+                                prev["task1_pred"][sys] = t1
+            except json.JSONDecodeError:
+                pass
+    return rows
 
 
 def load_done_ids(path) -> set:

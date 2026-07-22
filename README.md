@@ -85,7 +85,7 @@ Output is appended to the JSONL file after each segment completes (all systems).
 
 ## Data
 
-Input files are one JSONL file per language pair (e.g. `en-de.json`), expected in the same directory as `run_qe.py` by default (override with `--data-dir`). Each line is one segment:
+Input files are one JSONL file per language pair (e.g. `en-de.jsonl`), expected under `../data/` by default (override with `--data-dir`). Each line is one segment:
 
 ```json
 {
@@ -201,7 +201,7 @@ Edit the configuration block at the top of `slurm/run_qe_local.sh` (model, think
 sbatch slurm/run_qe_local.sh
 ```
 
-This launches 21 jobs in parallel (`--array=0-20`), one per language pair, each on a single H200. Logs are written to `slurm/logs/qe_local_{jobid}_{arrayid}.out/err`.
+This launches 23 jobs in parallel (`--array=0-22`), one per language pair, each on a single H200. Logs are written to `slurm/logs/qe_local_{jobid}_{arrayid}.out/err`.
 
 To test a single pair before committing to the full array:
 ```bash
@@ -209,6 +209,60 @@ sbatch --array=0 slurm/run_qe_local.sh   # runs cs-de (index 0)
 ```
 
 All jobs use `--resume`, so re-submitting the array after a failure or cancellation only processes segments not yet written.
+
+---
+
+### Sharded SLURM job array (A100s, faster)
+
+`slurm/run_qe_local_sharded_gemma4.sh` splits each language pair into 4 shards processed in parallel, targeting ~12 h wall time instead of 36–48 h. With 23 pairs × 4 shards = 92 jobs:
+
+```bash
+sbatch slurm/run_qe_local_sharded_gemma4.sh
+```
+
+Shard output files are named `pred_gemma4_{pair}_s0of4.jsonl` through `pred_gemma4_{pair}_s3of4.jsonl`. After all jobs complete, merge and verify completeness:
+
+```bash
+python merge_shards.py                    # all 23 pairs
+python merge_shards.py --pair en-de       # single pair
+python merge_shards.py --dry-run          # check only, no merge
+```
+
+`merge_shards.py` deduplicates by `item_id` (preferring scored rows over null-score rows from crashed jobs), merges with any pre-existing unsharded base file, and writes the merged result in source order to `pred_gemma4_{pair}.jsonl`.
+
+**Resume behaviour:** `--resume` is always active. When re-running after a partial run or when new hypothesis systems are added to the data, each shard only processes segments/systems not yet scored — existing results are merged in before writing.
+
+---
+
+### Diagnosing job failures
+
+**Check which array tasks failed or are still running:**
+```bash
+bash check_logs.sh                          # gemma4 shards (default)
+bash check_logs.sh slurm/logs qe_qwen_shard # different pattern
+```
+
+Outputs succeeded/failed/unknown counts, failure reasons, and a ready-to-paste `sbatch --array=...` resubmit command for failed tasks.
+
+**Analyze warning counts by language pair:**
+```bash
+python analyze_warnings.py                  # all pairs, sorted by total warnings
+python analyze_warnings.py --top 10         # worst 10 pairs
+python analyze_warnings.py --pattern qe_qwen_shard
+```
+
+Reports Stage 1 warnings (span not found in hypothesis) and Stage 2 warnings (failed to parse score) per pair, deduplicated to avoid counting crash-resume reruns twice.
+
+---
+
+### fix_zero_spans.py
+
+This script back-fills `"start": 0, "end": 0` placeholder spans with correct character offsets by re-running string matching against the hypothesis text. It is no longer needed for new runs — the span-matching fix is now applied inline in `run_qe_local.py` before writing output. It remains available for correcting older output files if needed:
+
+```bash
+python fix_zero_spans.py                          # all pred_gemma4_*.jsonl files
+python fix_zero_spans.py pred_gemma4_en-de.jsonl  # single file
+```
 
 ---
 
@@ -220,7 +274,7 @@ Key settings in `qe_utils.py`:
 |---|---|---|
 | `HYP_SYSTEM` | `"Gemini 3.1 Pro"` | Unused in full runs (all systems evaluated); kept as a reference |
 | `N_INSTANCES_PER_PAIR` | `None` | Cap segments per pair; `None` = all |
-| `TARGET_PAIRS` | 21 pairs | Language pairs and their FLORES-200 codes |
+| `TARGET_PAIRS` | 23 pairs | Language pairs and their FLORES-200 codes |
 | `DOMAIN_REQUIREMENTS` | 6 domains | Per-domain prompt text for Stage 1 and Stage 2 |
 
 Key settings in `run_qe_local.py`:
@@ -232,7 +286,3 @@ Key settings in `run_qe_local.py`:
 | `MAX_NEW_TOKENS_STAGE2` | `64` | Stage 2 token budget (hardcoded; just a number) |
 
 ---
-
-## TODOs
-
-- [ ] **Add remaining 2 language pairs** to `TARGET_PAIRS` once data is released (21 of 23 currently configured).

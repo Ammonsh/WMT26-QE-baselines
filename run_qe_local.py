@@ -41,7 +41,7 @@ from qe_utils import (
     stage1_to_predicted_errors,
     make_row,
     append_row,
-    load_done_ids,
+    load_done_rows,
 )
 
 # ============================================================================
@@ -247,6 +247,14 @@ def parse_args():
         "--resume", action="store_true",
         help="Skip segments already present in the output file (matched by item_id).",
     )
+    p.add_argument(
+        "--num-shards", type=int, default=1,
+        help="Total number of shards for parallel array jobs. Default 1 = no sharding.",
+    )
+    p.add_argument(
+        "--shard", type=int, default=0,
+        help="Zero-based shard index for this job (0 .. num-shards-1).",
+    )
     return p.parse_args()
 
 
@@ -358,23 +366,49 @@ def main():
 
     thinking_tag = "_thinking" if args.thinking else ""
     model_tag = f"{args.model}{thinking_tag}"
+    shard_tag = f"_s{args.shard}of{args.num_shards}" if args.num_shards > 1 else ""
 
     wrapper = LocalModelWrapper(args.model, thinking=args.thinking)
 
     for pair, cfg in active_pairs.items():
-        output_path = output_dir / f"pred_{model_tag}_{pair}.jsonl"
+        output_path = output_dir / f"pred_{model_tag}_{pair}{shard_tag}.jsonl"
         instances = instances_by_pair.get(pair, [])
 
-        done_ids = load_done_ids(output_path) if args.resume else set()
-        todo = [inst for inst in instances if inst["doc_id"] not in done_ids]
+        # Shard filter: deterministic, based on position in the full ordered list.
+        # Must happen before resume filtering so each shard owns a stable slice.
+        if args.num_shards > 1:
+            instances = [inst for i, inst in enumerate(instances) if i % args.num_shards == args.shard]
+
+        # System-level resume: load best known row per segment (merges duplicates).
+        done_rows: dict = {}
+        if args.resume:
+            done_rows = load_done_rows(output_path)
+            base_path = output_dir / f"pred_{model_tag}_{pair}.jsonl"
+            if args.num_shards > 1 and base_path.exists():
+                for iid, row in load_done_rows(base_path).items():
+                    if iid not in done_rows:
+                        done_rows[iid] = row
+
+        # Build work items: segments with at least one unscored system.
+        work_items = []
+        for inst in instances:
+            existing = done_rows.get(inst["doc_id"])
+            done_sys = (
+                {s for s, v in existing.get("task2_pred", {}).items() if v is not None}
+                if existing else set()
+            )
+            new_sys = [(s, h) for s, h in inst["_raw"].get("hyps", {}).items()
+                       if h and s not in done_sys]
+            if new_sys:
+                work_items.append((inst, new_sys, existing))
+
         logging.info("[%s] %d/%d segments to process → %s",
-                     pair, len(todo), len(instances), output_path.name)
+                     pair, len(work_items), len(instances), output_path.name)
 
         pair_start = time.monotonic()
-        for seg_i, inst in enumerate(todo):
+        for seg_i, (inst, systems, existing_row) in enumerate(work_items):
             src = inst["src_text"]
             domain = get_domain(inst["doc_id"])
-            systems = [(sys, hyp) for sys, hyp in inst["_raw"].get("hyps", {}).items() if hyp]
             task1_results = {}
             task2_results = {}
 
@@ -425,12 +459,17 @@ def main():
                     logging.debug("[%s] %s | %s: %d errors, score=%s",
                                   pair, inst["doc_id"], system, len(parsed["errors"]), score)
 
-            # Checkpoint: append this segment immediately so progress survives cancellation
-            append_row(make_row(inst, task1_results, task2_results), output_path)
+            # Merge new results with prior row (if any), then checkpoint immediately.
+            if existing_row is not None:
+                merged_t1 = {**existing_row.get("task1_pred", {}), **task1_results}
+                merged_t2 = {**existing_row.get("task2_pred", {}), **task2_results}
+            else:
+                merged_t1, merged_t2 = task1_results, task2_results
+            append_row(make_row(inst, merged_t1, merged_t2), output_path)
             if (seg_i + 1) % 10 == 0:
                 elapsed = int(time.monotonic() - pair_start)
                 logging.info("[%s] %d/%d segments done | elapsed %dh%02dm%02ds",
-                             pair, seg_i + 1, len(todo),
+                             pair, seg_i + 1, len(work_items),
                              elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60)
 
         logging.info("[%s] complete → %s", pair, output_path.name)
