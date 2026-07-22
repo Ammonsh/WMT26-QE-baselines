@@ -39,7 +39,7 @@ from google.genai import types
 # CONFIG
 # ============================================================================
 
-MODEL_ID = "gemini-3-flash-preview"
+MODEL_ID = "gemini-3.6-flash"
 OUTPUT_NAME = MODEL_ID
 OUTPUT_DIR = Path("quality_estimation_outputs_gemini")
 
@@ -135,11 +135,12 @@ _STAGE2_SCORING_BODY = (
     "where N is an integer from 0 to 100."
 )
 
-# Language pairs for the WMT26 QE task (21 of 23 released).
-# Keys match data filenames (e.g. "en-de" -> en-de.json).
+# Language pairs for the WMT26 QE task (23 pairs).
+# Keys match data filenames (e.g. "en-de" -> en-de.jsonl).
 # src_code/tgt_code are the FLORES-200 codes from item_id fields.
 TARGET_PAIRS = {
     "cs-de":   {"src_name": "Czech",              "tgt_name": "German",              "src_code": "ces_Latn", "tgt_code": "deu_Latn"},
+    "cs-uk":   {"src_name": "Czech",              "tgt_name": "Ukrainian",           "src_code": "ces_Latn", "tgt_code": "ukr_Cyrl"},
     "cs-vi":   {"src_name": "Czech",              "tgt_name": "Vietnamese",          "src_code": "ces_Latn", "tgt_code": "vie_Latn"},
     "en-areg": {"src_name": "English",            "tgt_name": "Egyptian Arabic",     "src_code": "eng_Latn", "tgt_code": "arz_Arab"},
     "en-be":   {"src_name": "English",            "tgt_name": "Belarusian",          "src_code": "eng_Latn", "tgt_code": "bel_Cyrl"},
@@ -155,6 +156,7 @@ TARGET_PAIRS = {
     "en-lij":  {"src_name": "English",            "tgt_name": "Ligurian",            "src_code": "eng_Latn", "tgt_code": "lij_Latn"},
     "en-lld":  {"src_name": "English",            "tgt_name": "Ladin",               "src_code": "eng_Latn", "tgt_code": "lld_Latn"},
     "en-ru":   {"src_name": "English",            "tgt_name": "Russian",             "src_code": "eng_Latn", "tgt_code": "rus_Cyrl"},
+    "en-se":   {"src_name": "English",            "tgt_name": "Northern Sámi",       "src_code": "eng_Latn", "tgt_code": "sme_Latn"},
     "en-th":   {"src_name": "English",            "tgt_name": "Thai",                "src_code": "eng_Latn", "tgt_code": "tha_Thai"},
     "en-uk":   {"src_name": "English",            "tgt_name": "Ukrainian",           "src_code": "eng_Latn", "tgt_code": "ukr_Cyrl"},
     "en-zhcn": {"src_name": "English",            "tgt_name": "Simplified Chinese",  "src_code": "eng_Latn", "tgt_code": "zho_Hans"},
@@ -183,7 +185,7 @@ def get_domain(item_id: str) -> str:
 def load_instances(data_dir=None, target_pairs=None):
     """Load QE instances from per-pair JSONL files under data_dir.
 
-    Each file is named '{pair}.json' (e.g. 'en-de.json') and is actually JSONL.
+    Each file is named '{pair}.jsonl' (e.g. 'en-de.jsonl').
     Returns a dict mapping lang-pair key -> list of instance dicts, each with:
       doc_id, src_text, hyp_text, refA, _raw (original JSON dict)
     """
@@ -192,7 +194,7 @@ def load_instances(data_dir=None, target_pairs=None):
 
     buckets = {pair: [] for pair in target_pairs}
     for pair in target_pairs:
-        fpath = data_dir / f"{pair}.json"
+        fpath = data_dir / f"{pair}.jsonl"
         with open(fpath, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -431,7 +433,7 @@ def main():
     parser.add_argument("--pair", default=None,
                         help="Process only this language pair (e.g. en-de).")
     parser.add_argument("--data-dir", default=None,
-                        help="Directory containing the .json data files (default: same directory as this script).")
+                        help="Directory containing the .jsonl data files (default: same directory as this script).")
     parser.add_argument("--resume", action="store_true",
                         help="Skip segments already present in the output file.")
     args = parser.parse_args()
