@@ -13,43 +13,32 @@ LLM-as-judge baseline for the WMT 2026 Automated MT Evaluation Shared Task.
 pip install -U google-genai
 ```
 
-**2. Extract the data tarball into the same directory as `run_qe.py`:**
-```bash
-tar -xzf test-set-files-v1.tar.gz
-# Result: en-de.json, en-cs.json, ... sitting next to run_qe.py -- should be 23 total files
-```
-
-**3. Set your API key:**
+**2. Set your API key:**
 ```bash
 export GEMINI_API_KEY="your_key_here"
 ```
 
-**4. Test on one segment** (prints prompts and responses, no file written):
+**3. Test on one segment** (prints prompts and responses, no file written):
 ```bash
-python run_qe.py --test
+python run_qe.py --data-file mteval-test26.jsonl --test
 ```
 
-**5. Full run** (all 23 language pairs, outputs written to `quality_estimation_outputs_gemini/`):
+**4. Full run — official segments** (all 21 language pairs, output written to `quality_estimation_outputs_gemini/`):
 ```bash
-python run_qe.py
+python run_qe.py --data-file mteval-test26.jsonl --segment-type official
 ```
 
-**6. Resume an interrupted run:**
+**5. Resume an interrupted run:**
 ```bash
-python run_qe.py --resume
+python run_qe.py --data-file mteval-test26.jsonl --segment-type official --resume
 ```
 
 **Optional — single language pair:**
 ```bash
-python run_qe.py --pair en-de
+python run_qe.py --data-file mteval-test26.jsonl --segment-type official --pair en-de
 ```
 
-**Optional — custom data directory** (if data files are not in the same directory as the script):
-```bash
-python run_qe.py --data-dir /path/to/data/
-```
-
-> The model is set by `MODEL_ID` near the top of `run_qe.py` (default: `gemini-3-flash-preview`).
+> The model is set by `MODEL_ID` near the top of `run_qe.py` (default: `gemini-3.6-flash`).
 > Thinking is enabled at `medium` level by default (`THINKING_LEVEL` at the top of the script).
 > On daily quota exhaustion the partial result is saved automatically — re-run with `--resume` the next day.
 
@@ -85,11 +74,11 @@ Output is appended to the JSONL file after each segment completes (all systems).
 
 ## Data
 
-Input files are one JSONL file per language pair (e.g. `en-de.jsonl`), expected under `../data/` by default (override with `--data-dir`). Each line is one segment:
+All language pairs are in a single combined JSONL file (`mteval-test26.jsonl`). Each line is one segment:
 
 ```json
 {
-  "item_id": "eng_Latn_###_deu_Latn_###_social_###_116262294091035303_###_0",
+  "item_id": "official_###_eng_Latn_###_deu_Latn_###_social_###_116262294091035303_###_0",
   "src": "source text",
   "ref": {"text": "reference translation", "type": "postedit"},
   "hyps": {
@@ -100,7 +89,7 @@ Input files are one JSONL file per language pair (e.g. `en-de.jsonl`), expected 
 }
 ```
 
-The `item_id` encodes source language, target language, domain, document ID, and segment index as `_###_`-separated fields. 21 of 23 language pairs are currently configured in `TARGET_PAIRS` in `qe_utils.py`.
+The `item_id` is `_###_`-separated: `{seg_type}_###_{src_code}_###_{tgt_code}_###_{domain}_###_{doc_id}_###_{seg_idx}`. The first field is `"official"` or `"challenge"`. Official segments use FLORES-200 language codes; challenge segments use short two-letter codes. 21 language pairs are configured in `TARGET_PAIRS` in `qe_utils.py`.
 
 ---
 
@@ -110,7 +99,7 @@ Each input segment produces one JSONL line with `task1_pred` (error spans per sy
 
 ```json
 {
-  "item_id": "eng_Latn_###_deu_Latn_###_speech_###_id_rtWATtjAFUM_29.58-58.15_###_0",
+  "item_id": "official_###_eng_Latn_###_deu_Latn_###_speech_###_id_rtWATtjAFUM_29.58-58.15_###_0",
   "task1_pred": {
     "Gemini 3.1 Pro": {
       "errors": [
@@ -146,9 +135,11 @@ Each input segment produces one JSONL line with `task1_pred` (error spans per sy
 
 See the **Quick Start** section at the top of this README for setup and run instructions.
 
-Output is written to `quality_estimation_outputs_gemini/pred_{MODEL_ID}_{pair}.jsonl`. The model ID and thinking level are set by `MODEL_ID` and `THINKING_LEVEL` at the top of `run_qe.py`. On daily quota exhaustion the partial segment is saved and the script exits cleanly — re-run with `--resume` the next day.
+Output is written to a single file `quality_estimation_outputs_gemini/pred_{OUTPUT_NAME}.jsonl` (all pairs combined). The model ID and thinking level are set by `MODEL_ID` and `THINKING_LEVEL` at the top of `run_qe.py`. On daily quota exhaustion the partial segment is saved and the script exits cleanly — re-run with `--resume` the next day.
 
 Rate limiting is disabled by default (`MIN_INTERVAL_SEC = 0`). If you are using a free-tier key (~10 req/min limit), set `MIN_INTERVAL_SEC = 6.5` at the top of the script.
+
+Use `--segment-type official` or `--segment-type challenge` to restrict to one segment type; default is `all`. Use `--workers N` (default 4) to control API parallelism.
 
 ---
 
@@ -163,27 +154,27 @@ bash slurm/cache_models.sh
 
 **Test on one segment of one system** (no file written):
 ```bash
-python run_qe_local.py --model gemma4 --test
-python run_qe_local.py --model qwen36 --test
+python run_qe_local.py --model gemma4 --data-file mteval-test26.jsonl --test
+python run_qe_local.py --model qwen36 --data-file mteval-test26.jsonl --test
 ```
 
 **Single pair (recommended for testing timing):**
 ```bash
-python run_qe_local.py --model gemma4 --pair cs-de
+python run_qe_local.py --model gemma4 --data-file mteval-test26.jsonl --segment-type official --pair cs-de
 ```
 
 **Resume an interrupted run:**
 ```bash
-python run_qe_local.py --model gemma4 --pair cs-de --resume
+python run_qe_local.py --model gemma4 --data-file mteval-test26.jsonl --segment-type official --pair cs-de --resume
 ```
 
 **With thinking mode** (chain-of-thought, uses more tokens):
 ```bash
-python run_qe_local.py --model gemma4 --thinking
-python run_qe_local.py --model qwen36 --thinking --max-new-tokens 8192
+python run_qe_local.py --model gemma4 --data-file mteval-test26.jsonl --thinking
+python run_qe_local.py --model qwen36 --data-file mteval-test26.jsonl --thinking --max-new-tokens 8192
 ```
 
-Output is written to `quality_estimation_outputs_local/pred_{model}_{pair}.jsonl`.
+Output is written to `quality_estimation_outputs_local/pred_{model}_{pair}.jsonl`. Use `--segment-type official` or `--segment-type challenge` to restrict to one segment type (default: `all`).
 
 **Token budgets:** Stage 1 (error annotation) uses `--max-new-tokens` (default 512). Stage 2 (scoring) always uses a fixed budget of 64 tokens since it only outputs a number.
 
@@ -214,21 +205,21 @@ All jobs use `--resume`, so re-submitting the array after a failure or cancellat
 
 ### Sharded SLURM job array (A100s, faster)
 
-`slurm/run_qe_local_sharded_gemma4.sh` splits each language pair into 4 shards processed in parallel, targeting ~12 h wall time instead of 36–48 h. With 23 pairs × 4 shards = 92 jobs:
+`slurm/run_qe_local_sharded_qwen36.sh` (and the equivalent gemma4 script) splits each language pair into 4 shards processed in parallel, targeting ~12 h wall time instead of 36–48 h. With 21 pairs × 4 shards = 84 jobs:
 
 ```bash
-sbatch slurm/run_qe_local_sharded_gemma4.sh
+sbatch slurm/run_qe_local_sharded_qwen36.sh
 ```
 
-Shard output files are named `pred_gemma4_{pair}_s0of4.jsonl` through `pred_gemma4_{pair}_s3of4.jsonl`. After all jobs complete, merge and verify completeness:
+Shard output files are named `pred_qwen36_{pair}_s0of4.jsonl` through `pred_qwen36_{pair}_s3of4.jsonl`. After all jobs complete, merge all pairs into a single output file in source order:
 
 ```bash
-python merge_shards.py                    # all 23 pairs
-python merge_shards.py --pair en-de       # single pair
-python merge_shards.py --dry-run          # check only, no merge
+python merge_shards.py --model qwen36 --segment-type official          # all 21 pairs
+python merge_shards.py --model qwen36 --segment-type official --dry-run  # check only
+python merge_shards.py --model qwen36 --pair en-de                     # single pair
 ```
 
-`merge_shards.py` deduplicates by `item_id` (preferring scored rows over null-score rows from crashed jobs), merges with any pre-existing unsharded base file, and writes the merged result in source order to `pred_gemma4_{pair}.jsonl`.
+`merge_shards.py` collects rows from all shard files across all pairs, deduplicates by `item_id` (preferring scored rows over null-score rows from crashed jobs), and writes a single merged file `pred_{model}.jsonl` in the same order as the source data file.
 
 **Resume behaviour:** `--resume` is always active. When re-running after a partial run or when new hypothesis systems are added to the data, each shard only processes segments/systems not yet scored — existing results are merged in before writing.
 
@@ -255,17 +246,6 @@ Reports Stage 1 warnings (span not found in hypothesis) and Stage 2 warnings (fa
 
 ---
 
-### fix_zero_spans.py
-
-This script back-fills `"start": 0, "end": 0` placeholder spans with correct character offsets by re-running string matching against the hypothesis text. It is no longer needed for new runs — the span-matching fix is now applied inline in `run_qe_local.py` before writing output. It remains available for correcting older output files if needed:
-
-```bash
-python fix_zero_spans.py                          # all pred_gemma4_*.jsonl files
-python fix_zero_spans.py pred_gemma4_en-de.jsonl  # single file
-```
-
----
-
 ## Configuration
 
 Key settings in `qe_utils.py`:
@@ -274,8 +254,8 @@ Key settings in `qe_utils.py`:
 |---|---|---|
 | `HYP_SYSTEM` | `"Gemini 3.1 Pro"` | Unused in full runs (all systems evaluated); kept as a reference |
 | `N_INSTANCES_PER_PAIR` | `None` | Cap segments per pair; `None` = all |
-| `TARGET_PAIRS` | 23 pairs | Language pairs and their FLORES-200 codes |
-| `DOMAIN_REQUIREMENTS` | 6 domains | Per-domain prompt text for Stage 1 and Stage 2 |
+| `TARGET_PAIRS` | 21 pairs | Language pairs and their FLORES-200 codes |
+| `DOMAIN_REQUIREMENTS` | 7 domains | Per-domain prompt text for Stage 1 and Stage 2 (news, factchecking, speech, social, software, edu, general) |
 
 Key settings in `run_qe_local.py`:
 

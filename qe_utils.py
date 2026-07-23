@@ -28,7 +28,7 @@ N_INSTANCES_PER_PAIR = None     # None = all segments (no cap)
 SYSTEM_PROMPT = "Your task is to identify machine translation errors and assess the quality of the translation."
 
 # Domain requirement text inserted into Stage 1 and Stage 2 prompts.
-# Keys match the domain component of item_id (3rd _###_ field).
+# Keys match the domain component of item_id (4th _###_ field). Unknown domains fall back to "general".
 DOMAIN_REQUIREMENTS = {
     "news": (
         "The source segment is from a news article. The translation should use a formal "
@@ -65,6 +65,9 @@ DOMAIN_REQUIREMENTS = {
         "The source segment consists of biology, chemistry, and geography exercises from an "
         "educational web portal for children aged 9-16. The translation should be suitable for "
         "this educational context and age range, and preserve the source HTML formatting."
+    ),
+    "general": (
+        "The translation should be accurate and fluent."
     ),
 }
 
@@ -106,8 +109,7 @@ _STAGE2_SCORING_BODY = (
 )
 
 # Language pairs for the WMT26 QE task (23 pairs).
-# Keys match data filenames (e.g. "en-de" -> ../data/en-de.jsonl).
-# src_code/tgt_code are the FLORES-200 codes from item_id fields.
+# src_code/tgt_code are the FLORES-200 codes used in official item_id fields.
 TARGET_PAIRS = {
     "cs-de":   {"src_name": "Czech",              "tgt_name": "German",              "src_code": "ces_Latn", "tgt_code": "deu_Latn"},
     "cs-uk":   {"src_name": "Czech",              "tgt_name": "Ukrainian",           "src_code": "ces_Latn", "tgt_code": "ukr_Cyrl"},
@@ -134,69 +136,95 @@ TARGET_PAIRS = {
     "zhcn-ja": {"src_name": "Simplified Chinese", "tgt_name": "Japanese",            "src_code": "zho_Hans", "tgt_code": "jpn_Jpan"},
 }
 
+# Challenge segments use short 2-letter language codes instead of FLORES-200 codes.
+# Maps (short_src, short_tgt) -> TARGET_PAIRS key. Pairs with no official equivalent are omitted.
+CHALLENGE_CODE_MAP = {
+    ("cs", "de"):    "cs-de",
+    ("cs", "uk"):    "cs-uk",
+    ("en", "ar"):    "en-areg",
+    ("en", "cs"):    "en-cs",
+    ("en", "de"):    "en-de",
+    ("en", "de_DE"): "en-de",
+    ("en", "is"):    "en-is",
+    ("en", "ja"):    "en-ja",
+    ("en", "ja_JP"): "en-ja",
+    ("en", "ko"):    "en-ko",
+    ("en", "ru"):    "en-ru",
+    ("en", "uk"):    "en-uk",
+    ("en", "zh"):    "en-zhcn",
+    ("en", "zh_CN"): "en-zhcn",
+    ("zh", "ja"):    "zhcn-ja",
+}
+
 
 # ============================================================================
 # DATA LOADING
 # ============================================================================
 
 def extract_base_pair(item_id):
-    """Parse a new-format item_id into (src_code, tgt_code, domain, doc_id).
+    """Split item_id into its '_###_'-separated components.
 
-    item_id format: '{src}_###_{tgt}_###_{domain}_###_{doc_id}[_###_{seg_idx}]'
-    Returns a tuple of the '_###_'-separated parts (variable length).
+    item_id format: '{seg_type}_###_{src_code}_###_{tgt_code}_###_{domain}_###_...'
+    Returns a tuple of variable length.
     """
     return tuple(item_id.split("_###_"))
 
 
 def get_domain(item_id: str) -> str:
-    """Extract domain from item_id (3rd _###_ component). Falls back to 'news'."""
+    """Extract domain from item_id (4th _###_ component). Falls back to 'general'."""
     parts = extract_base_pair(item_id)
-    domain = parts[2] if len(parts) > 2 else "news"
+    domain = parts[3] if len(parts) > 3 else "general"
     if domain not in DOMAIN_REQUIREMENTS:
-        logging.warning("Unknown domain %r in item_id %r — falling back to 'news'", domain, item_id)
-        return "news"
+        logging.warning("Unknown domain %r in item_id %r — falling back to 'general'", domain, item_id)
+        return "general"
     return domain
 
 
-def load_instances(
-    data_dir=None,
-    hyp_system=None,
-    n_instances=None,
-    target_pairs=None,
-):
-    """Load QE instances from per-pair JSONL files under data_dir.
+def load_instances(data_file, target_pairs=None, segment_type="all"):
+    """Load QE instances from a single combined JSONL file.
 
-    Each file is named '{pair}.jsonl' (e.g. 'en-de.jsonl').
-    New field mapping vs. old humeval format:
-      item_id -> doc_id  |  src -> src_text  |  hyps[system] -> hyp_text
-      ref.text -> refA
-
+    The language pair is derived from src_code and tgt_code embedded in item_id
+    (format: {seg_type}_###_{src_code}_###_{tgt_code}_###_{domain}_###_...).
+    segment_type: "official", "challenge", or "all" (default).
     Returns a dict mapping lang-pair key -> list of instance dicts, each with:
       doc_id, src_text, hyp_text, refA, _raw (original JSON dict)
     """
-    data_dir = Path(data_dir) if data_dir else DATA_DIR
-    hyp_system = hyp_system or HYP_SYSTEM
-    n_instances = n_instances if n_instances is not None else N_INSTANCES_PER_PAIR
     target_pairs = target_pairs or TARGET_PAIRS
+    code_to_pair = {(v["src_code"], v["tgt_code"]): k for k, v in target_pairs.items()}
+    _warned_challenge_codes = set()
 
     buckets = {pair: [] for pair in target_pairs}
-    for pair in target_pairs:
-        fpath = data_dir / f"{pair}.jsonl"
-        with open(fpath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                if n_instances is not None and len(buckets[pair]) >= n_instances:
-                    break
-                d = json.loads(line)
-                buckets[pair].append({
-                    "doc_id": d["item_id"],
-                    "src_text": d.get("src", ""),
-                    "hyp_text": d.get("hyps", {}).get(hyp_system, ""),
-                    "refA": d.get("ref", {}).get("text"),
-                    "_raw": d,  # keep original for output
-                })
+    with open(data_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            item_id = d["item_id"]
+            parts = item_id.split("_###_")
+            if len(parts) < 3:
+                continue
+            if segment_type != "all" and parts[0] != segment_type:
+                continue
+            codes = (parts[1], parts[2])
+            if parts[0] == "challenge":
+                pair = CHALLENGE_CODE_MAP.get(codes)
+                if pair is None and codes not in _warned_challenge_codes:
+                    logging.warning("Challenge pair %s-%s has no TARGET_PAIRS entry — skipping.", *codes)
+                    _warned_challenge_codes.add(codes)
+            else:
+                pair = code_to_pair.get(codes)
+            if pair is None or pair not in buckets:
+                continue
+            if N_INSTANCES_PER_PAIR is not None and len(buckets[pair]) >= N_INSTANCES_PER_PAIR:
+                continue
+            buckets[pair].append({
+                "doc_id": item_id,
+                "src_text": d.get("src", ""),
+                "hyp_text": d.get("hyps", {}).get(HYP_SYSTEM, ""),
+                "refA": d.get("ref", {}).get("text"),
+                "_raw": d,
+            })
     return buckets
 
 

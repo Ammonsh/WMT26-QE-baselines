@@ -4,10 +4,14 @@ Merge shard JSONL files and verify completeness against source data.
 Shard naming: pred_{model}_{pair}_s0of4.jsonl .. pred_{model}_{pair}_s3of4.jsonl
               (0-indexed: s0of4 through s3of4)
 
+All pairs are merged into a single output file (pred_{model}.jsonl) in the
+same order as the source data file (mteval-test26.jsonl by default).
+
 Usage (from WMT26-QE-baselines/):
     python merge_shards.py                          # gemma4, all pairs
     python merge_shards.py --model qwen36           # qwen36, all pairs
     python merge_shards.py --model gemma4 --pair cs-de  # single pair
+    python merge_shards.py --segment-type official  # filter to official segments
     python merge_shards.py --dry-run                # check only, no merge
 """
 
@@ -17,24 +21,50 @@ from pathlib import Path
 
 PAIRS = [
     "cs-de", "cs-uk", "cs-vi", "en-areg", "en-be", "en-cs", "en-de", "en-et", "en-hy",
-    "en-id", "en-is", "en-ja", "en-kk", "en-ko", "en-lij", "en-lld", "en-ru",
+    "en-id", "en-is", "en-kk", "en-lij", "en-lld", "en-ru",
     "en-se", "en-th", "en-uk", "en-zhcn", "en-zhtw", "zhcn-ja",
 ]
 
 SCRIPT_DIR = Path(__file__).parent
-DATA_DIR = SCRIPT_DIR / "../data"
 OUTPUT_DIR = SCRIPT_DIR / "quality_estimation_outputs_local"
 
 
-def get_source_ids(pair: str) -> list[str]:
-    """Read item_ids from the source data file in their original order."""
+def get_source_ids(data_file: Path, pairs: list[str], segment_type: str) -> list[str]:
+    """Read item_ids from the combined source file in their original order.
+
+    Filters by segment_type ('official', 'challenge', or 'all') and restricts
+    to the requested pairs based on src/tgt codes embedded in the item_id.
+    """
+    from qe_utils import TARGET_PAIRS, CHALLENGE_CODE_MAP
+
+    # Build set of pair keys we care about
+    pair_set = set(pairs)
+
+    # Reverse lookup: (src_code, tgt_code) -> pair key, for official segments
+    code_to_pair = {}
+    for key, cfg in TARGET_PAIRS.items():
+        code_to_pair[(cfg["src_code"], cfg["tgt_code"])] = key
+
     ids = []
-    fpath = DATA_DIR / f"{pair}.jsonl"
-    with open(fpath, encoding="utf-8") as f:
+    with open(data_file, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
-                ids.append(json.loads(line)["item_id"])
+            if not line:
+                continue
+            item_id = json.loads(line)["item_id"]
+            parts = item_id.split("_###_")
+            if len(parts) < 3:
+                continue
+            seg_type = parts[0]
+            if segment_type != "all" and seg_type != segment_type:
+                continue
+            codes = (parts[1], parts[2])
+            if seg_type == "challenge":
+                pair_key = CHALLENGE_CODE_MAP.get(codes)
+            else:
+                pair_key = code_to_pair.get(codes)
+            if pair_key in pair_set:
+                ids.append(item_id)
     return ids
 
 
@@ -78,77 +108,91 @@ def dedup_rows(rows: list[dict]) -> dict[str, dict]:
     return best
 
 
-def merge_and_verify(pair: str, model: str, num_shards: int, dry_run: bool) -> bool:
-    """Merge shards (+ any pre-existing base file) for one pair and verify completeness.
+def collect_shard_rows(pairs: list[str], model: str, num_shards: int) -> tuple[dict, list[str]]:
+    """Collect and deduplicate rows from all shard files across all pairs.
 
-    Segments written to the base file by a prior unsharded run are included so
-    they are not reported as missing.  Duplicate entries (e.g. from null-score
-    rows that were re-processed) are collapsed, preferring scored rows.
-
-    Returns True if all expected segments are accounted for.
+    Returns (deduped_dict, list_of_missing_shard_filenames).
+    Per-pair base files (from unsharded runs) are also included as a fallback.
     """
-    shard_files = [
-        OUTPUT_DIR / f"pred_{model}_{pair}_s{i}of{num_shards}.jsonl"
-        for i in range(num_shards)
-    ]
-    base_file = OUTPUT_DIR / f"pred_{model}_{pair}.jsonl"
-
-    missing_shards = [f for f in shard_files if not f.exists()]
-    if missing_shards and not base_file.exists():
-        print(f"  [{pair}] MISSING shard files:")
-        for f in missing_shards:
-            print(f"    {f.name}")
-        return False
-
-    # Collect all rows: shard files first, then base file (for resume-skipped segments)
     all_rows: list[dict] = []
-    for sf in shard_files:
-        all_rows.extend(read_rows(sf))
-    base_rows = read_rows(base_file)
+    missing_shards: list[str] = []
 
-    # Deduplicate: shard rows take priority over base rows (shards are the new source of truth),
-    # but base rows fill in segments that resume intentionally skipped.
+    for pair in pairs:
+        shard_files = [
+            OUTPUT_DIR / f"pred_{model}_{pair}_s{i}of{num_shards}.jsonl"
+            for i in range(num_shards)
+        ]
+        base_file = OUTPUT_DIR / f"pred_{model}_{pair}.jsonl"
+
+        pair_has_shards = False
+        for sf in shard_files:
+            if sf.exists():
+                all_rows.extend(read_rows(sf))
+                pair_has_shards = True
+            else:
+                missing_shards.append(sf.name)
+
+        # Include the per-pair base file if it exists (prior unsharded run or previous merge).
+        # Shard rows take priority (added first), base rows fill gaps.
+        base_rows = read_rows(base_file)
+        if base_rows:
+            all_rows.extend(base_rows)
+
+        if not pair_has_shards and not base_rows:
+            pass  # will show up as missing in verification
+
     deduped = dedup_rows(all_rows)
-    for row in base_rows:
-        iid = row.get("item_id")
-        if iid and iid not in deduped:
-            deduped[iid] = row
+    return deduped, missing_shards
 
-    expected_ids = get_source_ids(pair)
+
+def verify_and_merge(pairs: list[str], model: str, num_shards: int,
+                     data_file: Path, segment_type: str, dry_run: bool) -> bool:
+    """Collect all shard rows, verify completeness, and write a single merged output file."""
+    deduped, missing_shards = collect_shard_rows(pairs, model, num_shards)
+
+    expected_ids = get_source_ids(data_file, pairs, segment_type)
     expected_set = set(expected_ids)
     found_set = set(deduped.keys())
 
-    raw_count = len(all_rows) + len(base_rows)
-    dupes = raw_count - len(deduped)
     missing = expected_set - found_set
     extra = found_set - expected_set
 
-    ok = not missing and not extra
-    status = "OK" if ok else "FAIL"
-    print(f"  [{pair}] {status} — expected {len(expected_ids)}, unique found {len(found_set)}"
-          + (f", missing {len(missing)}" if missing else "")
-          + (f", extra {len(extra)}" if extra else "")
-          + (f", duplicates collapsed {dupes}" if dupes else "")
-          + (f" [{len(base_rows)} from base file]" if base_rows else ""))
+    if missing_shards:
+        print(f"Missing shard files ({len(missing_shards)}):")
+        for name in sorted(missing_shards):
+            print(f"  {name}")
 
+    print(f"Expected: {len(expected_ids)} segments across {len(pairs)} pair(s)")
+    print(f"Found:    {len(found_set)} unique rows")
     if missing:
-        for iid in sorted(missing)[:5]:
-            print(f"    MISSING: {iid}")
-        if len(missing) > 5:
-            print(f"    ... and {len(missing) - 5} more")
+        print(f"MISSING:  {len(missing)}")
+        for iid in sorted(missing)[:10]:
+            print(f"  {iid}")
+        if len(missing) > 10:
+            print(f"  ... and {len(missing) - 10} more")
+    if extra:
+        print(f"EXTRA:    {len(extra)} (not in source file for selected segment type)")
 
-    if not dry_run and ok:
-        merged_path = base_file
-        with open(merged_path, "w", encoding="utf-8") as out:
-            for iid in expected_ids:  # write in source order
-                row = deduped.get(iid)
-                if row:
-                    out.write(json.dumps(row, ensure_ascii=False) + "\n")
-        print(f"    → wrote {merged_path.name} ({len(expected_ids)} rows, source order)")
-    elif not dry_run and not ok:
-        print(f"    → skipped merge (incomplete)")
+    ok = not missing
+    if not ok:
+        if not dry_run:
+            print("→ skipped merge (incomplete)")
+        return False
 
-    return ok
+    if dry_run:
+        print("→ dry run complete, no files written")
+        return True
+
+    out_path = OUTPUT_DIR / f"pred_{model}.jsonl"
+    with open(out_path, "w", encoding="utf-8") as out:
+        written = 0
+        for iid in expected_ids:
+            row = deduped.get(iid)
+            if row:
+                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                written += 1
+    print(f"→ wrote {out_path.name} ({written} rows, source order)")
+    return True
 
 
 def main():
@@ -156,26 +200,20 @@ def main():
     p.add_argument("--model", default="gemma4", help="Model tag (default: gemma4)")
     p.add_argument("--num-shards", type=int, default=4, help="Number of shards (default: 4)")
     p.add_argument("--pair", default=None, help="Single pair to process (default: all)")
-    p.add_argument("--dry-run", action="store_true", help="Check only, do not write merged files")
+    p.add_argument("--data-file", default=None,
+                   help="Path to combined source JSONL (default: mteval-test26.jsonl next to script)")
+    p.add_argument("--segment-type", default="all", choices=["official", "challenge", "all"],
+                   help="Which segments to expect in output (default: all)")
+    p.add_argument("--dry-run", action="store_true", help="Check only, do not write merged file")
     args = p.parse_args()
 
     pairs = [args.pair] if args.pair else PAIRS
+    data_file = Path(args.data_file) if args.data_file else SCRIPT_DIR / "mteval-test26.jsonl"
+
     mode = "DRY RUN — " if args.dry_run else ""
-    print(f"{mode}Merging {args.num_shards} shards for model={args.model}, {len(pairs)} pair(s)\n")
+    print(f"{mode}model={args.model}, {len(pairs)} pair(s), segment-type={args.segment_type}\n")
 
-    results = {}
-    for pair in pairs:
-        results[pair] = merge_and_verify(pair, args.model, args.num_shards, args.dry_run)
-
-    passed = sum(results.values())
-    total = len(results)
-    print(f"\n{'=' * 50}")
-    print(f"Result: {passed}/{total} pairs complete")
-    if passed < total:
-        print("Incomplete pairs:")
-        for pair, ok in results.items():
-            if not ok:
-                print(f"  {pair}")
+    verify_and_merge(pairs, args.model, args.num_shards, data_file, args.segment_type, args.dry_run)
 
 
 if __name__ == "__main__":

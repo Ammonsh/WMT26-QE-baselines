@@ -1,30 +1,30 @@
 #!/bin/bash --login
 # ============================================================================
-# WMT26 QE baseline — Gemma-4-31B-it on A100s, sharded for speed
+# WMT26 QE baseline — Qwen3.6-35B-A3B on A100s, sharded for speed
 # Job array: 21 pairs × 4 shards = 84 jobs total (array 0-83).
 #
 # Each job processes ~25 % of one language pair's segments in parallel,
 # targeting ~12 h wall time (vs 36-48 h for a full single-job run).
 #
-# GPU memory guidance (BF16 weights ~62 GB):
-#   4× A100 80GB  — ~258 GB free for KV cache; use --batch-size 32
+# GPU memory guidance (BF16 weights ~70 GB):
+#   4× A100 80GB  — ~122 GB free for KV cache; use --batch-size 32
 #
 # Edit the Configuration block below, then:
-#   sbatch slurm/run_qe_local_sharded_gemma4.sh
+#   sbatch slurm/run_qe_local_a100_sharded.sh
 # To smoke-test a single shard (pair=cs-de, shard 0):
-#   sbatch --array=0 slurm/run_qe_local_sharded_gemma4.sh
+#   sbatch --array=0 slurm/run_qe_local_a100_sharded.sh
 #
 # After all jobs complete, merge all pairs into one file (source order):
-#   python merge_shards.py --model gemma4 --segment-type official
+#   python merge_shards.py --model qwen36 --segment-type official
 # ============================================================================
 
 #SBATCH --time=24:00:00
-#SBATCH --job-name=qe_gemma_shard
+#SBATCH --job-name=qe_qwen_shard
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:4
-#SBATCH --mem=512G
+#SBATCH --mem=1T
 #SBATCH --array=0-83
 #SBATCH --qos=matrix
 #SBATCH --output=slurm/logs/%x_%A_%a.out
@@ -32,10 +32,10 @@
 #SBATCH --exclude=dw-2-4
 
 # ── Configuration (edit as needed) ─────────────────────────────────────────
-MODEL="gemma4"           # gemma4 | qwen36
+MODEL="qwen36"           # gemma4 | qwen36
 THINKING=false           # true | false
 MAX_NEW_TOKENS=512       # Stage 1 token budget; recommend 8192+ when THINKING=true
-BATCH_SIZE=32            # 32 for 2× A100; 2 when THINKING=true
+BATCH_SIZE=8            # 32 for 2× A100; 2 when THINKING=true
 NUM_SHARDS=4             # Number of shards per pair (array size must be pairs × shards)
 # ───────────────────────────────────────────────────────────────────────────
 

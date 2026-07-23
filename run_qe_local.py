@@ -231,8 +231,20 @@ def parse_args():
         help="Output directory (default: quality_estimation_outputs_local).",
     )
     p.add_argument(
+        "--data-file", required=True,
+        help="Path to the combined JSONL data file (e.g. mteval-test26.jsonl).",
+    )
+    p.add_argument(
+        "--segment-type", default="all", choices=["official", "challenge", "all"],
+        help="Which segments to evaluate: 'official', 'challenge', or 'all' (default).",
+    )
+    p.add_argument(
         "--pair", default=None,
         help="Process only this language pair (e.g. cs-de). Useful for SLURM job arrays.",
+    )
+    p.add_argument(
+        "--max-segments", type=int, default=None,
+        help="Cap segments per language pair; useful for testing.",
     )
     p.add_argument(
         "--batch-size", type=int, default=None,
@@ -310,7 +322,11 @@ def main():
     else:
         active_pairs = TARGET_PAIRS
 
-    instances_by_pair = load_instances(target_pairs=active_pairs)
+    instances_by_pair = load_instances(
+        data_file=args.data_file,
+        target_pairs=active_pairs,
+        segment_type=args.segment_type,
+    )
 
     # ── Smoke-test mode ───────────────────────────────────────────────────
     if args.test:
@@ -398,9 +414,12 @@ def main():
                 if existing else set()
             )
             new_sys = [(s, h) for s, h in inst["_raw"].get("hyps", {}).items()
-                       if h and s not in done_sys]
+                       if s not in done_sys]
             if new_sys:
                 work_items.append((inst, new_sys, existing))
+
+        if args.max_segments is not None:
+            work_items = work_items[:args.max_segments]
 
         logging.info("[%s] %d/%d segments to process → %s",
                      pair, len(work_items), len(instances), output_path.name)
@@ -415,6 +434,18 @@ def main():
             # Process all systems for this segment in sub-batches.
             for b_start in range(0, len(systems), batch_size):
                 sub = systems[b_start:b_start + batch_size]
+
+                # Short-circuit empty hypotheses (omission errors, score 0).
+                non_empty_sub = []
+                for system, hyp in sub:
+                    if not hyp:
+                        task1_results[system] = {"errors": [], "omission": "major", "instruction_fault": None}
+                        task2_results[system] = 0
+                    else:
+                        non_empty_sub.append((system, hyp))
+                sub = non_empty_sub
+                if not sub:
+                    continue
 
                 # Stage 1: error annotation
                 s1_msgs = [

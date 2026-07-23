@@ -15,14 +15,15 @@ Setup:
   pip install -U google-genai
   export GEMINI_API_KEY="your_key_here"
 
-Run (after extracting the data tarball next to this script):
-  python run_qe.py --test          # test on one segment, no file written
-  python run_qe.py                 # full run, all language pairs
-  python run_qe.py --pair en-de    # single pair
-  python run_qe.py --resume        # resume an interrupted run
+Run:
+  python run_qe.py --data-file mteval-test26.jsonl --test   # test on one segment, no file written
+  python run_qe.py --data-file mteval-test26.jsonl          # full run, all language pairs
+  python run_qe.py --data-file mteval-test26.jsonl --pair en-de    # single pair
+  python run_qe.py --data-file mteval-test26.jsonl --resume        # resume an interrupted run
 """
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from threading import Lock
 
 from google import genai
 from google.genai import types
@@ -58,7 +60,7 @@ MAX_BACKOFF_SEC = 120
 SYSTEM_PROMPT = "Your task is to identify machine translation errors and assess the quality of the translation."
 
 # Domain requirement text inserted into Stage 1 and Stage 2 prompts.
-# Keys match the domain component of item_id (3rd _###_ field).
+# Keys match the domain component of item_id (4th _###_ field). Unknown domains fall back to "general".
 DOMAIN_REQUIREMENTS = {
     "news": (
         "The source segment is from a news article. The translation should use a formal "
@@ -95,6 +97,9 @@ DOMAIN_REQUIREMENTS = {
         "The source segment consists of biology, chemistry, and geography exercises from an "
         "educational web portal for children aged 9-16. The translation should be suitable for "
         "this educational context and age range, and preserve the source HTML formatting."
+    ),
+    "general": (
+        "The translation should be accurate and fluent."
     ),
 }
 
@@ -167,49 +172,88 @@ TARGET_PAIRS = {
 HYP_SYSTEM = "Gemini 3.1 Pro"  # reference system name; all hyps are evaluated in full runs
 N_INSTANCES_PER_PAIR = None     # None = all segments (no cap)
 
+# Challenge segments use short 2-letter language codes instead of FLORES-200 codes.
+# Maps (short_src, short_tgt) -> TARGET_PAIRS key. Pairs with no official equivalent are omitted.
+CHALLENGE_CODE_MAP = {
+    ("cs", "de"):    "cs-de",
+    ("cs", "uk"):    "cs-uk",
+    ("en", "ar"):    "en-areg",
+    ("en", "cs"):    "en-cs",
+    ("en", "de"):    "en-de",
+    ("en", "de_DE"): "en-de",
+    ("en", "is"):    "en-is",
+    ("en", "ja"):    "en-ja",
+    ("en", "ja_JP"): "en-ja",
+    ("en", "ko"):    "en-ko",
+    ("en", "ru"):    "en-ru",
+    ("en", "uk"):    "en-uk",
+    ("en", "zh"):    "en-zhcn",
+    ("en", "zh_CN"): "en-zhcn",
+    ("zh", "ja"):    "zhcn-ja",
+}
+
 
 # ============================================================================
 # DATA LOADING
 # ============================================================================
 
 def get_domain(item_id: str) -> str:
-    """Extract domain from item_id (3rd _###_ component). Falls back to 'news'."""
+    """Extract domain from item_id (4th _###_ component). Falls back to 'news'."""
     parts = tuple(item_id.split("_###_"))
-    domain = parts[2] if len(parts) > 2 else "news"
+    domain = parts[3] if len(parts) > 3 else "news"
     if domain not in DOMAIN_REQUIREMENTS:
-        logging.warning("Unknown domain %r in item_id %r — falling back to 'news'", domain, item_id)
-        return "news"
+        logging.warning("Unknown domain %r in item_id %r — falling back to 'general'", domain, item_id)
+        return "general"
     return domain
 
 
-def load_instances(data_dir=None, target_pairs=None):
-    """Load QE instances from per-pair JSONL files under data_dir.
+def load_instances(data_file, target_pairs=None, segment_type="all"):
+    """Load QE instances from a single combined JSONL file.
 
-    Each file is named '{pair}.jsonl' (e.g. 'en-de.jsonl').
+    Each line contains all language pairs. The language pair is derived from
+    the src_code and tgt_code fields embedded in item_id
+    (format: {seg_type}_###_{src_code}_###_{tgt_code}_###_{domain}_###_...).
+    segment_type: "official", "challenge", or "all" (default).
     Returns a dict mapping lang-pair key -> list of instance dicts, each with:
       doc_id, src_text, hyp_text, refA, _raw (original JSON dict)
     """
-    data_dir = Path(data_dir) if data_dir else Path(".")
     target_pairs = target_pairs or TARGET_PAIRS
+    code_to_pair = {(v["src_code"], v["tgt_code"]): k for k, v in target_pairs.items()}
+    _warned_challenge_codes = set()
 
     buckets = {pair: [] for pair in target_pairs}
-    for pair in target_pairs:
-        fpath = data_dir / f"{pair}.jsonl"
-        with open(fpath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                if N_INSTANCES_PER_PAIR is not None and len(buckets[pair]) >= N_INSTANCES_PER_PAIR:
-                    break
-                d = json.loads(line)
-                buckets[pair].append({
-                    "doc_id": d["item_id"],
-                    "src_text": d.get("src", ""),
-                    "hyp_text": d.get("hyps", {}).get(HYP_SYSTEM, ""),
-                    "refA": d.get("ref", {}).get("text"),
-                    "_raw": d,
-                })
+    with open(data_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            item_id = d["item_id"]
+            parts = item_id.split("_###_")
+            if len(parts) < 3:
+                continue
+            if segment_type != "all" and parts[0] != segment_type:
+                continue
+            seg_type = parts[0]
+            codes = (parts[1], parts[2])
+            if seg_type == "challenge":
+                pair = CHALLENGE_CODE_MAP.get(codes)
+                if pair is None and codes not in _warned_challenge_codes:
+                    logging.warning("Challenge pair %s-%s has no TARGET_PAIRS entry — skipping.", *codes)
+                    _warned_challenge_codes.add(codes)
+            else:
+                pair = code_to_pair.get(codes)
+            if pair is None or pair not in buckets:
+                continue
+            if N_INSTANCES_PER_PAIR is not None and len(buckets[pair]) >= N_INSTANCES_PER_PAIR:
+                continue
+            buckets[pair].append({
+                "doc_id": item_id,
+                "src_text": d.get("src", ""),
+                "hyp_text": d.get("hyps", {}).get(HYP_SYSTEM, ""),
+                "refA": d.get("ref", {}).get("text"),
+                "_raw": d,
+            })
     return buckets
 
 
@@ -432,8 +476,14 @@ def main():
                         help="Run one segment of one system (prints prompts+responses, no file written)")
     parser.add_argument("--pair", default=None,
                         help="Process only this language pair (e.g. en-de).")
-    parser.add_argument("--data-dir", default=None,
-                        help="Directory containing the .jsonl data files (default: same directory as this script).")
+    parser.add_argument("--data-file", required=True,
+                        help="Path to the combined JSONL data file (e.g. mteval-test26.jsonl).")
+    parser.add_argument("--segment-type", default="all", choices=["official", "challenge", "all"],
+                        help="Which segments to evaluate: 'official', 'challenge', or 'all' (default).")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Number of parallel worker threads (default: 4).")
+    parser.add_argument("--max-segments", type=int, default=None,
+                        help="Cap segments per language pair; useful for testing.")
     parser.add_argument("--resume", action="store_true",
                         help="Skip segments already present in the output file.")
     args = parser.parse_args()
@@ -456,7 +506,7 @@ def main():
         """
         base = dict(
             system_instruction=SYSTEM_PROMPT,
-            temperature=0.0,
+            temperature=1.0,
             max_output_tokens=8192,
         )
         for tc in (
@@ -509,7 +559,8 @@ def main():
     else:
         active_pairs = TARGET_PAIRS
 
-    instances_by_pair = load_instances(data_dir=args.data_dir, target_pairs=active_pairs)
+    instances_by_pair = load_instances(data_file=args.data_file, target_pairs=active_pairs,
+                                       segment_type=args.segment_type)
 
     if args.test:
         pair = next(iter(active_pairs))
@@ -554,65 +605,97 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    _rl_lock = Lock()
+    _last_call = [0.0]
+
     def _rate_limited_call(prompt):
-        nonlocal last_call
         if MIN_INTERVAL_SEC > 0:
-            elapsed = time.time() - last_call
-            if elapsed < MIN_INTERVAL_SEC:
-                time.sleep(MIN_INTERVAL_SEC - elapsed)
-        result = call_api_with_retries(prompt)
-        last_call = time.time()
-        return result
+            with _rl_lock:
+                elapsed = time.time() - _last_call[0]
+                wait = MIN_INTERVAL_SEC - elapsed
+                if wait > 0:
+                    time.sleep(wait)
+                _last_call[0] = time.time()
+        return call_api_with_retries(prompt)
 
-    last_call = 0.0
+    def process_segment(pair, cfg, inst, output_path, file_lock):
+        src = inst["src_text"]
+        domain = get_domain(inst["doc_id"])
+        hyps = inst["_raw"].get("hyps", {})
+        task1_results = {}
+        task2_results = {}
+
+        for system, hyp in hyps.items():
+            if not hyp:
+                task1_results[system] = {"errors": [], "omission": "major", "instruction_fault": None}
+                task2_results[system] = 0
+                continue
+            try:
+                raw1 = _rate_limited_call(build_stage1_prompt(src, hyp, cfg, domain))
+                stage1_text = parse_stage1_output(raw1)
+                parsed = stage1_to_predicted_errors(stage1_text, hyp)
+                raw2 = _rate_limited_call(build_stage2_prompt(src, hyp, stage1_text, cfg, domain))
+                score = parse_stage2_output(raw2)
+                task1_results[system] = {
+                    "errors": parsed["errors"],
+                    "omission": parsed["omission"],
+                    "instruction_fault": parsed["instruction_fault"],
+                }
+                task2_results[system] = score
+            except DailyQuotaExhausted:
+                with file_lock:
+                    append_row(make_row(inst, task1_results, task2_results), output_path)
+                raise
+            except Exception as e:
+                logging.error(f"[{pair}] {inst['doc_id']} | {system} failed: {e}")
+                task1_results[system] = {"errors": [], "omission": None, "instruction_fault": None}
+                task2_results[system] = None
+
+        with file_lock:
+            append_row(make_row(inst, task1_results, task2_results), output_path)
+
+    # Build work list across all pairs
+    output_path = OUTPUT_DIR / f"pred_{OUTPUT_NAME}.jsonl"
+    file_lock = Lock()
+    done_ids = load_done_ids(output_path) if args.resume else set()
+
+    work_items = []
     for pair, cfg in active_pairs.items():
-        output_path = OUTPUT_DIR / f"pred_{OUTPUT_NAME}_{pair}.jsonl"
         instances = instances_by_pair.get(pair, [])
-
-        done_ids = load_done_ids(output_path) if args.resume else set()
         todo = [inst for inst in instances if inst["doc_id"] not in done_ids]
+        if args.max_segments is not None:
+            todo = todo[:args.max_segments]
         logging.info(f"[{pair}] {len(todo)}/{len(instances)} segments to process "
                      f"(2 API calls × N systems each) → {output_path.name}")
+        for inst in todo:
+            work_items.append((pair, cfg, inst, output_path, file_lock))
 
-        for seg_i, inst in enumerate(todo):
-            src = inst["src_text"]
-            domain = get_domain(inst["doc_id"])
-            hyps = inst["_raw"].get("hyps", {})
-            task1_results = {}
-            task2_results = {}
+    n_total = len(work_items)
+    n_done = 0
+    logging.info(f"Processing {n_total} segments total with {args.workers} worker(s).")
 
-            for system, hyp in hyps.items():
-                if not hyp:
-                    continue
-                try:
-                    raw1 = _rate_limited_call(build_stage1_prompt(src, hyp, cfg, domain))
-                    stage1_text = parse_stage1_output(raw1)
-                    parsed = stage1_to_predicted_errors(stage1_text, hyp)
-                    raw2 = _rate_limited_call(build_stage2_prompt(src, hyp, stage1_text, cfg, domain))
-                    score = parse_stage2_output(raw2)
-                    task1_results[system] = {
-                        "errors": parsed["errors"],
-                        "omission": parsed["omission"],
-                        "instruction_fault": parsed["instruction_fault"],
-                    }
-                    task2_results[system] = score
-                except DailyQuotaExhausted as e:
-                    append_row(make_row(inst, task1_results, task2_results), output_path)
-                    logging.error(
-                        f"DAILY QUOTA EXHAUSTED at [{pair}] {inst['doc_id']} | {system}. "
-                        f"Partial segment saved. Resume with --resume tomorrow.\n  Detail: {e}"
-                    )
-                    sys.exit(1)
-                except Exception as e:
-                    logging.error(f"[{pair}] {inst['doc_id']} | {system} failed: {e}")
-                    task1_results[system] = {"errors": [], "omission": None, "instruction_fault": None}
-                    task2_results[system] = None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(process_segment, pair, cfg, inst, output_path, lock): (pair, inst["doc_id"])
+            for pair, cfg, inst, output_path, lock in work_items
+        }
+        for future in concurrent.futures.as_completed(futures):
+            pair, doc_id = futures[future]
+            try:
+                future.result()
+            except DailyQuotaExhausted as e:
+                logging.error(
+                    f"DAILY QUOTA EXHAUSTED at [{pair}] {doc_id}. "
+                    f"Partial segment saved. Resume with --resume tomorrow.\n  Detail: {e}"
+                )
+                executor.shutdown(wait=False, cancel_futures=True)
+                sys.exit(1)
+            except Exception as e:
+                logging.error(f"[{pair}] {doc_id} unexpected error: {e}")
+            n_done += 1
+            if n_done % 10 == 0:
+                logging.info(f"{n_done}/{n_total} segments done")
 
-            append_row(make_row(inst, task1_results, task2_results), output_path)
-            if (seg_i + 1) % 10 == 0:
-                logging.info(f"[{pair}] {seg_i + 1}/{len(todo)} segments done")
-
-        logging.info(f"[{pair}] complete → {output_path.name}")
     logging.info("Done.")
 
 
