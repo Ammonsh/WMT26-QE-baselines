@@ -45,7 +45,7 @@ MODEL_ID = "gemini-3.6-flash"
 OUTPUT_NAME = MODEL_ID
 OUTPUT_DIR = Path("quality_estimation_outputs_gemini")
 
-THINKING_LEVEL = "medium"   # "low" / "medium" / "high" for Gemini 3.x; "none" to disable
+THINKING_LEVEL = "medium"   # "low" / "medium" / "high" for Gemini 3.x; "minimal" to disable for Gemini 3 models
 
 MIN_INTERVAL_SEC = 0        # 0 = disabled (for enterprise/internal API access)
                             # set to 6.5 for free-tier (~10 req/min rate limit)
