@@ -270,8 +270,27 @@ def build_stage2_prompt(
 # ============================================================================
 
 def _strip_thinking(text: str) -> str:
-    """Remove <think>…</think> blocks (Qwen3.6 / Gemma-4 thinking mode)."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    """Remove thinking blocks from model output.
+
+    Handles:
+      - Qwen3.6 closed block: <think>...</think>
+      - Qwen3.6 unclosed block (generation truncated mid-thought): <think>...EOF
+      - Gemma-4 closed block: <|channel>thought...<channel|>
+        (note: closing delimiter is "<channel|>" — reversed pipe position vs.
+        the opener, NOT "<|channel>response")
+      - Gemma-4 unclosed block: <|channel>thought...EOF
+    """
+    # Qwen3.6: closed block first, then unclosed (order matters)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    # Gemma-4: closed block — match the REAL closing delimiter
+    text = re.sub(r"<\|channel>thought.*?<channel\|>\s*", "", text, flags=re.DOTALL)
+    # Gemma-4 unclosed block (truncated mid-thought, no closing delimiter present)
+    text = re.sub(r"<\|channel>thought.*", "", text, flags=re.DOTALL)
+    # Strip any stray leftover markers of either orientation
+    text = re.sub(r"<\|channel>\S*\s*", "", text)
+    text = re.sub(r"<channel\|>\s*", "", text)
+    return text.strip()
 
 
 def parse_stage1_output(text: str) -> str:

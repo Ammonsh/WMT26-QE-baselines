@@ -56,8 +56,10 @@ MODELS = {
 # Default max_new_tokens. With thinking, much more budget is needed.
 DEFAULT_MAX_NEW_TOKENS = 512
 DEFAULT_MAX_NEW_TOKENS_THINKING = 8192
-# Stage 2 outputs {"score": N} JSON — small budget is fine; 64 allows for
-# markdown fences (```json...```) in case the model adds them.
+# Stage 2 always runs with thinking disabled (enable_thinking=False) even when
+# the model is loaded in thinking mode. Stage 2 just needs {"score": N} and the
+# error annotations from Stage 1 are already in the prompt — thinking adds no
+# value and wastes many tokens. 64 allows for markdown fences if the model adds them.
 MAX_NEW_TOKENS_STAGE2 = 64
 
 
@@ -97,7 +99,8 @@ class LocalModelWrapper:
         logging.info("Loading model %s across available GPUs …", model_id)
         try:
             import flash_attn  # noqa: F401
-            attn_impl = "flash_attention_2"
+            # flash-attn 2.x only supports head_dim <= 256; Gemma-4 exceeds this.
+            attn_impl = "flash_attention_2" if model_type != "gemma4" else "sdpa"
         except ImportError:
             attn_impl = "sdpa"
         logging.info("Attention implementation: %s", attn_impl)
@@ -106,7 +109,7 @@ class LocalModelWrapper:
             torch_dtype="auto",
             device_map="auto",
             low_cpu_mem_usage=True,
-            attn_implementation=attn_impl,
+            # attn_implementation=attn_impl,
         )
         self.model.eval()
 
@@ -122,10 +125,11 @@ class LocalModelWrapper:
             model_id, next(self.model.parameters()).dtype, thinking,
         )
 
-    def _gen_kwargs(self, max_new_tokens: int) -> dict:
+    def _gen_kwargs(self, max_new_tokens: int, thinking: bool | None = None) -> dict:
+        thinking = self.thinking if thinking is None else thinking
         kwargs: dict = {"max_new_tokens": max_new_tokens,
                         "pad_token_id": self._tokenizer.eos_token_id}
-        if self.thinking:
+        if thinking:
             kwargs.update({"do_sample": True, "temperature": 0.6, "top_p": 0.95})
         else:
             kwargs.update({"do_sample": False, "temperature": None, "top_p": None})
@@ -144,22 +148,27 @@ class LocalModelWrapper:
         self,
         messages: list[dict],
         max_new_tokens: int,
+        enable_thinking: bool | None = None,
     ) -> tuple[str, int, int]:
-        """Run a single inference call. Returns (response_text, input_tokens, output_tokens)."""
+        """Run a single inference call. Returns (response_text, input_tokens, output_tokens).
+
+        enable_thinking overrides self.thinking for this call (e.g. False for Stage 2).
+        """
         import torch
 
+        thinking = self.thinking if enable_thinking is None else enable_thinking
         text = self.processor.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=self.thinking,
+            enable_thinking=thinking,
         )
 
         inputs = self.processor(text=text, return_tensors="pt").to(self.model.device)
         input_tokens = inputs["input_ids"].shape[-1]
 
         with torch.no_grad():
-            output_ids = self.model.generate(**inputs, **self._gen_kwargs(max_new_tokens))
+            output_ids = self.model.generate(**inputs, **self._gen_kwargs(max_new_tokens, thinking=thinking))
 
         new_ids = output_ids[0, input_tokens:]
         return self._decode_new_ids(new_ids), input_tokens, len(new_ids)
@@ -168,18 +177,21 @@ class LocalModelWrapper:
         self,
         batch_messages: list[list[dict]],
         max_new_tokens: int,
+        enable_thinking: bool | None = None,
     ) -> list[tuple[str, int, int]]:
         """Run batched inference. Returns list of (response_text, input_tokens, output_tokens).
 
         Uses left-padding so all sequences in the batch generate from the same
         position, which is required for decoder-only autoregressive models.
+        enable_thinking overrides self.thinking for this call (e.g. False for Stage 2).
         """
         import torch
 
+        thinking = self.thinking if enable_thinking is None else enable_thinking
         texts = [
             self.processor.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=True,
-                enable_thinking=self.thinking,
+                enable_thinking=thinking,
             )
             for msgs in batch_messages
         ]
@@ -194,7 +206,7 @@ class LocalModelWrapper:
         padded_len = inputs["input_ids"].shape[1]
 
         with torch.no_grad():
-            output_ids = self.model.generate(**inputs, **self._gen_kwargs(max_new_tokens))
+            output_ids = self.model.generate(**inputs, **self._gen_kwargs(max_new_tokens, thinking=thinking))
 
         results = []
         for i in range(len(batch_messages)):
@@ -224,7 +236,7 @@ def parse_args():
         "--max-new-tokens", type=int, default=None,
         help=f"Max tokens to generate for Stage 1 (default {DEFAULT_MAX_NEW_TOKENS} "
              f"without thinking, {DEFAULT_MAX_NEW_TOKENS_THINKING} with --thinking). "
-             f"Stage 2 always uses {MAX_NEW_TOKENS_STAGE2} tokens.",
+             f"Stage 2 always uses {MAX_NEW_TOKENS_STAGE2} tokens (thinking disabled for Stage 2).",
     )
     p.add_argument(
         "--output-dir", default="quality_estimation_outputs_local",
@@ -292,7 +304,7 @@ def _run_two_stage(wrapper, src, hyp, cfg, domain, max_new_tokens_s1):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": build_stage2_prompt(src, hyp, stage1_text, cfg, domain)},
     ]
-    raw2, in_tok2, out_tok2 = wrapper.generate(messages2, MAX_NEW_TOKENS_STAGE2)
+    raw2, in_tok2, out_tok2 = wrapper.generate(messages2, MAX_NEW_TOKENS_STAGE2, enable_thinking=False)
     score = parse_stage2_output(raw2)
     return stage1_text, parsed, score, (in_tok1, out_tok1, in_tok2, out_tok2)
 
@@ -366,7 +378,7 @@ def main():
         print("STAGE 2 PROMPT:")
         print(prompt2)
         print("=" * 60)
-        raw2, in_tok2, out_tok2 = wrapper.generate(messages2, MAX_NEW_TOKENS_STAGE2)
+        raw2, in_tok2, out_tok2 = wrapper.generate(messages2, MAX_NEW_TOKENS_STAGE2, enable_thinking=False)
         print("STAGE 2 RESPONSE:")
         print(raw2)
         print("=" * 60)
@@ -473,7 +485,7 @@ def main():
                     for (_, hyp), s1_text in zip(sub, s1_texts)
                 ]
                 try:
-                    s2_outputs = wrapper.generate_batch(s2_msgs, MAX_NEW_TOKENS_STAGE2)
+                    s2_outputs = wrapper.generate_batch(s2_msgs, MAX_NEW_TOKENS_STAGE2, enable_thinking=False)
                 except Exception as e:
                     logging.error("[%s] %s stage2 batch failed: %s", pair, inst["doc_id"], e)
                     s2_outputs = [("", 0, 0)] * len(sub)

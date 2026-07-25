@@ -3,15 +3,21 @@ Merge shard JSONL files and verify completeness against source data.
 
 Shard naming: pred_{model}_{pair}_s0of4.jsonl .. pred_{model}_{pair}_s3of4.jsonl
               (0-indexed: s0of4 through s3of4)
+Unsharded (num-shards=1) runs write directly to pred_{model}_{pair}.jsonl.
 
-All pairs are merged into a single output file (pred_{model}.jsonl) in the
-same order as the source data file (mteval-test26.jsonl by default).
+All pairs are merged into a single output file in the same order as the
+source data file (mteval-test26.jsonl by default):
+  --segment-type official  → pred_{model}_official.jsonl
+  --segment-type challenge → pred_{model}_challenge.jsonl
+  --segment-type all       → pred_{model}.jsonl
+
+Note: when THINKING=true the model tag includes a _thinking suffix
+(e.g. qwen36_thinking), so pass --model qwen36_thinking accordingly.
 
 Usage (from WMT26-QE-baselines/):
-    python merge_shards.py                          # gemma4, all pairs
-    python merge_shards.py --model qwen36           # qwen36, all pairs
-    python merge_shards.py --model gemma4 --pair cs-de  # single pair
-    python merge_shards.py --segment-type official  # filter to official segments
+    python merge_shards.py --model qwen36_thinking --segment-type official
+    python merge_shards.py --model qwen36_thinking --segment-type challenge
+    python merge_shards.py --model gemma4_thinking --pair cs-de --segment-type official
     python merge_shards.py --dry-run                # check only, no merge
 """
 
@@ -19,10 +25,17 @@ import argparse
 import json
 from pathlib import Path
 
-PAIRS = [
+# Official test set — 21 pairs (en-ja and en-ko removed from final test set).
+OFFICIAL_PAIRS = [
     "cs-de", "cs-uk", "cs-vi", "en-areg", "en-be", "en-cs", "en-de", "en-et", "en-hy",
     "en-id", "en-is", "en-kk", "en-lij", "en-lld", "en-ru",
     "en-se", "en-th", "en-uk", "en-zhcn", "en-zhtw", "zhcn-ja",
+]
+
+# Challenge sets — 12 pairs (includes en-ja and en-ko, absent from official).
+CHALLENGE_PAIRS = [
+    "cs-de", "cs-uk", "en-areg", "en-cs", "en-de", "en-is", "en-ja", "en-ko",
+    "en-ru", "en-uk", "en-zhcn", "zhcn-ja",
 ]
 
 SCRIPT_DIR = Path(__file__).parent
@@ -112,34 +125,37 @@ def collect_shard_rows(pairs: list[str], model: str, num_shards: int) -> tuple[d
     """Collect and deduplicate rows from all shard files across all pairs.
 
     Returns (deduped_dict, list_of_missing_shard_filenames).
-    Per-pair base files (from unsharded runs) are also included as a fallback.
+    When num_shards <= 1 (unsharded run), only the base file is consulted.
+    Per-pair base files are also included as a fallback for sharded runs.
     """
     all_rows: list[dict] = []
     missing_shards: list[str] = []
 
     for pair in pairs:
-        shard_files = [
-            OUTPUT_DIR / f"pred_{model}_{pair}_s{i}of{num_shards}.jsonl"
-            for i in range(num_shards)
-        ]
         base_file = OUTPUT_DIR / f"pred_{model}_{pair}.jsonl"
 
-        pair_has_shards = False
-        for sf in shard_files:
-            if sf.exists():
-                all_rows.extend(read_rows(sf))
-                pair_has_shards = True
+        if num_shards > 1:
+            pair_has_shards = False
+            for i in range(num_shards):
+                sf = OUTPUT_DIR / f"pred_{model}_{pair}_s{i}of{num_shards}.jsonl"
+                if sf.exists():
+                    all_rows.extend(read_rows(sf))
+                    pair_has_shards = True
+                else:
+                    missing_shards.append(sf.name)
+
+            # Include the per-pair base file if it exists (prior unsharded run or previous merge).
+            # Shard rows take priority (added first), base rows fill gaps.
+            base_rows = read_rows(base_file)
+            if base_rows:
+                all_rows.extend(base_rows)
+        else:
+            # Unsharded run — output went directly to the base file.
+            base_rows = read_rows(base_file)
+            if base_rows:
+                all_rows.extend(base_rows)
             else:
-                missing_shards.append(sf.name)
-
-        # Include the per-pair base file if it exists (prior unsharded run or previous merge).
-        # Shard rows take priority (added first), base rows fill gaps.
-        base_rows = read_rows(base_file)
-        if base_rows:
-            all_rows.extend(base_rows)
-
-        if not pair_has_shards and not base_rows:
-            pass  # will show up as missing in verification
+                missing_shards.append(base_file.name)
 
     deduped = dedup_rows(all_rows)
     return deduped, missing_shards
@@ -183,7 +199,8 @@ def verify_and_merge(pairs: list[str], model: str, num_shards: int,
         print("→ dry run complete, no files written")
         return True
 
-    out_path = OUTPUT_DIR / f"pred_{model}.jsonl"
+    seg_tag = f"_{segment_type}" if segment_type != "all" else ""
+    out_path = OUTPUT_DIR / f"pred_{model}{seg_tag}.jsonl"
     with open(out_path, "w", encoding="utf-8") as out:
         written = 0
         for iid in expected_ids:
@@ -197,8 +214,10 @@ def verify_and_merge(pairs: list[str], model: str, num_shards: int,
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="gemma4", help="Model tag (default: gemma4)")
-    p.add_argument("--num-shards", type=int, default=4, help="Number of shards (default: 4)")
+    p.add_argument("--model", default="gemma4", help="Model tag (default: gemma4). "
+                   "Include _thinking suffix if the run used --thinking (e.g. qwen36_thinking).")
+    p.add_argument("--num-shards", type=int, default=4, help="Number of shards (default: 4). "
+                   "Use 1 for unsharded (challenge) runs.")
     p.add_argument("--pair", default=None, help="Single pair to process (default: all)")
     p.add_argument("--data-file", default=None,
                    help="Path to combined source JSONL (default: mteval-test26.jsonl next to script)")
@@ -207,7 +226,21 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="Check only, do not write merged file")
     args = p.parse_args()
 
-    pairs = [args.pair] if args.pair else PAIRS
+    if args.pair:
+        pairs = [args.pair]
+    elif args.segment_type == "challenge":
+        pairs = CHALLENGE_PAIRS
+    elif args.segment_type == "official":
+        pairs = OFFICIAL_PAIRS
+    else:
+        # "all": union of both lists, preserving order and deduplicating
+        seen = set()
+        pairs = []
+        for p_ in OFFICIAL_PAIRS + CHALLENGE_PAIRS:
+            if p_ not in seen:
+                pairs.append(p_)
+                seen.add(p_)
+
     data_file = Path(args.data_file) if args.data_file else SCRIPT_DIR / "mteval-test26.jsonl"
 
     mode = "DRY RUN — " if args.dry_run else ""
