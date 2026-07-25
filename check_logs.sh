@@ -4,17 +4,32 @@
 # recent log (highest job ID), so resubmitted tasks that succeeded override
 # earlier failures.
 #
+# Success is detected by the Python logger line:
+#   "Done. Output dir: ..."
+# Note: vLLM emits benign shutdown noise (ImportError: libnvrtc.so.13,
+# destroy_process_group warnings) even after a successful run — these are
+# NOT treated as errors.
+#
+# Recognised failure patterns:
+#   CUDA error          — GPU error during inference
+#   out of memory       — OOM
+#   CANCELLED AT        — SLURM wall-time or signal cancellation
+#   slurmstepd: error   — SLURM step daemon error
+#   Stale file handle   — NFS error in torch compile-cache or vLLM worker
+#   Failed to load artifact — torch compile-cache load error (covers non-POSIX NFS errno variants)
+#   RuntimeError: Worker failed — vLLM worker explicit crash
+#
 # Usage: bash check_logs.sh [log_dir] [job_name_pattern]
-# Defaults: log_dir=slurm/logs, pattern=qe_gemma_shard
+# Defaults: log_dir=slurm/logs, pattern=qe_qwen_shard
 
 LOG_DIR="${1:-slurm/logs}"
-PATTERN="${2:-qe_gemma_shard}"
+PATTERN="${2:-qe_qwen_shard}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/$LOG_DIR"
 
 SUCCESS_MARKER="Done. Output dir:"
-ERR_PATTERN="CUDA error|CANCELLED AT|out of memory|slurmstepd: error"
+ERR_PATTERN="CUDA error|CANCELLED AT|out of memory|slurmstepd: error|Stale file handle|Failed to load artifact|RuntimeError: Worker failed"
 
 if ! ls "$LOG_DIR"/${PATTERN}_*.err &>/dev/null; then
     echo "No log files found matching '${PATTERN}_*.err' in $LOG_DIR"
@@ -53,7 +68,10 @@ for task_id in $(echo "${!latest_err[@]}" | tr ' ' '\n' | sort -n); do
     if grep -q "$SUCCESS_MARKER" "$err_file"; then
         succeeded+=("$task_id")
     elif grep -qE "$ERR_PATTERN" "$err_file"; then
-        reason=$(grep -E "$ERR_PATTERN" "$err_file" | head -1 | sed 's/^[[:space:]]*//')
+        reason=$(grep -E "$ERR_PATTERN" "$err_file" | head -1 \
+            | sed 's/^[[:space:]]*//' \
+            | sed 's/(Worker_TP[0-9]* pid=[0-9]*) \[rank[0-9]*\]:[^]]*\] //' \
+            | cut -c1-120)
         failed+=("$task_id (job $job_id): $reason")
     else
         unknown+=("$task_id (job $job_id)")
