@@ -71,6 +71,14 @@ DOMAIN_REQUIREMENTS = {
     ),
 }
 
+# Maps reference type to a human-readable label used in prompts.
+# Falls back to "Reference translation" for unknown types.
+REF_LABELS = {
+    "human":    "Human reference translation",
+    "postedit": "Post-edited reference translation",
+    "pseudo":   "High-quality machine translation reference",
+}
+
 _STAGE1_ANNOTATION_BODY = (
     "Based on the source segment and machine translation surrounded by triple backticks, "
     "identify error types in the translation and classify them. The categories of errors are: "
@@ -78,6 +86,26 @@ _STAGE1_ANNOTATION_BODY = (
     "encoding, grammar, inconsistency, punctuation, register, spelling), style (awkward), "
     "terminology (inappropriate for context, inconsistent use), non-translation, other, or "
     "no-error.\n\n\n"
+    "Each error is classified as one of two categories: major or minor. Major errors disrupt "
+    "the flow and make the understandability of the text difficult or impossible. Minor errors "
+    "are errors that do not disrupt the flow significantly, and what the text is trying to say "
+    "is still understandable.\n\n\n"
+    "Return only the annotations in this format:\n"
+    "Major:\n"
+    "category/subcategory - \"error span\"\n"
+    "Minor:\n"
+    "category/subcategory - \"error span\"\n\n\n"
+    "Use one error per line and write no-error when a section is empty. Quote spans from the "
+    "translation; for omissions, quote the omitted source span."
+)
+
+_STAGE1_ANNOTATION_BODY_WITH_REF = (
+    "Based on the source segment, machine translation, and reference translation surrounded by "
+    "triple backticks, identify error types in the translation and classify them. The categories "
+    "of errors are: accuracy (addition, mistranslation, omission, untranslated text), fluency "
+    "(character encoding, grammar, inconsistency, punctuation, register, spelling), style "
+    "(awkward), terminology (inappropriate for context, inconsistent use), non-translation, "
+    "other, or no-error.\n\n\n"
     "Each error is classified as one of two categories: major or minor. Major errors disrupt "
     "the flow and make the understandability of the text difficult or impossible. Minor errors "
     "are errors that do not disrupt the flow significantly, and what the text is trying to say "
@@ -102,6 +130,25 @@ _STAGE2_SCORING_BODY = (
     "```{src_text}```\n"
     "{tgt_name} translation:\n"
     "```{hyp_text}```\n"
+    "Annotated error spans:\n"
+    "```{error_spans}```\n\n\n"
+    "Respond with ONLY a valid JSON object and nothing else: {{\"score\": N}}\n"
+    "where N is an integer from 0 to 100."
+)
+
+_STAGE2_SCORING_BODY_WITH_REF = (
+    "Given the translation from {src_name} to {tgt_name} and the annotated error spans, assign "
+    "a score on a continuous scale from 0 to 100. The scale has the following reference points: "
+    "0=\"No meaning preserved\", 33=\"Some meaning preserved\", 66=\"Most meaning preserved and "
+    "few grammar mistakes\", up to 100=\"Perfect meaning and grammar\".\n\n\n"
+    "Domain requirements: {domain_req}\n\n\n"
+    "Score the following translation:\n"
+    "{src_name} source:\n"
+    "```{src_text}```\n"
+    "{tgt_name} translation:\n"
+    "```{hyp_text}```\n"
+    "{ref_label}:\n"
+    "```{ref_text}```\n"
     "Annotated error spans:\n"
     "```{error_spans}```\n\n\n"
     "Respond with ONLY a valid JSON object and nothing else: {{\"score\": N}}\n"
@@ -223,6 +270,7 @@ def load_instances(data_file, target_pairs=None, segment_type="all"):
                 "src_text": d.get("src", ""),
                 "hyp_text": d.get("hyps", {}).get(HYP_SYSTEM, ""),
                 "refA": d.get("ref", {}).get("text"),
+                "ref_type": d.get("ref", {}).get("type"),
                 "_raw": d,
             })
     return buckets
@@ -232,11 +280,35 @@ def load_instances(data_file, target_pairs=None, segment_type="all"):
 # PROMPT BUILDERS (GEMBA-ESA two-stage)
 # ============================================================================
 
-def build_stage1_prompt(src_text: str, hyp_text: str, cfg: dict, domain: str) -> str:
-    """Build the Stage 1 error annotation prompt for the given domain."""
+def build_stage1_prompt(
+    src_text: str,
+    hyp_text: str,
+    cfg: dict,
+    domain: str,
+    ref_text: str | None = None,
+    ref_type: str | None = None,
+) -> str:
+    """Build the Stage 1 error annotation prompt for the given domain.
+
+    When ref_text is provided (non-empty), a reference block is inserted after the
+    hypothesis and the annotation instruction mentions the reference. Falls back to
+    the no-reference prompt when ref_text is absent or empty.
+    """
     src_name = cfg["src_name"]
     tgt_name = cfg["tgt_name"]
     domain_req = DOMAIN_REQUIREMENTS[domain]
+    if ref_text:
+        ref_label = REF_LABELS.get(ref_type, "Reference translation")
+        return (
+            f"{src_name} source:\n"
+            f"```{src_text}```\n"
+            f"{tgt_name} translation:\n"
+            f"```{hyp_text}```\n"
+            f"{ref_label}:\n"
+            f"```{ref_text}```\n\n\n"
+            f"{_STAGE1_ANNOTATION_BODY_WITH_REF}\n\n\n"
+            f"Domain requirements: {domain_req}"
+        )
     return (
         f"{src_name} source:\n"
         f"```{src_text}```\n"
@@ -253,8 +325,27 @@ def build_stage2_prompt(
     stage1_output: str,
     cfg: dict,
     domain: str,
+    ref_text: str | None = None,
+    ref_type: str | None = None,
 ) -> str:
-    """Build the Stage 2 scoring prompt using Stage 1 annotation output."""
+    """Build the Stage 2 scoring prompt using Stage 1 annotation output.
+
+    When ref_text is provided (non-empty), a reference block is included between
+    the hypothesis and the annotated error spans. Falls back to the no-reference
+    prompt when ref_text is absent or empty.
+    """
+    if ref_text:
+        ref_label = REF_LABELS.get(ref_type, "Reference translation")
+        return _STAGE2_SCORING_BODY_WITH_REF.format(
+            src_name=cfg["src_name"],
+            tgt_name=cfg["tgt_name"],
+            domain_req=DOMAIN_REQUIREMENTS[domain],
+            src_text=src_text,
+            hyp_text=hyp_text,
+            ref_label=ref_label,
+            ref_text=ref_text,
+            error_spans=stage1_output,
+        )
     return _STAGE2_SCORING_BODY.format(
         src_name=cfg["src_name"],
         tgt_name=cfg["tgt_name"],

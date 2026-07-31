@@ -45,6 +45,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 from qe_utils import (
     TARGET_PAIRS,
     SYSTEM_PROMPT,
+    REF_LABELS,
     load_instances,
     get_domain,
     build_stage1_prompt,
@@ -254,6 +255,13 @@ def parse_args():
         help="Skip segments already present in the output file (matched by item_id).",
     )
     p.add_argument(
+        "--with-ref", action="store_true",
+        help="Include the reference translation from the data 'ref' field in Stage 1 and "
+             "Stage 2 prompts. The prompt wording adapts to the reference type "
+             "(human/postedit/pseudo). Falls back to the no-reference prompt when "
+             "ref text is absent for a given segment.",
+    )
+    p.add_argument(
         "--num-shards", type=int, default=1,
         help="Total number of shards for parallel array jobs. Default 1 = no sharding.",
     )
@@ -321,11 +329,14 @@ def main():
         test_system, hyp = next(iter(hyps.items()))
         src = inst["src_text"]
         domain = get_domain(inst["doc_id"])
+        ref_text = inst.get("refA") if args.with_ref else None
+        ref_type = inst.get("ref_type") if args.with_ref else None
 
-        prompt1 = build_stage1_prompt(src, hyp, cfg, domain)
+        prompt1 = build_stage1_prompt(src, hyp, cfg, domain, ref_text=ref_text, ref_type=ref_type)
         messages1 = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt1}]
         print("=" * 60)
-        print(f"PAIR: {pair} | DOMAIN: {domain} | SYSTEM: {test_system}")
+        ref_info = f" | REF_TYPE: {ref_type}" if ref_text else " | REF: none"
+        print(f"PAIR: {pair} | DOMAIN: {domain} | SYSTEM: {test_system}{ref_info}")
         print("STAGE 1 PROMPT:")
         print(prompt1)
         print("=" * 60)
@@ -336,7 +347,7 @@ def main():
         stage1_text = parse_stage1_output(raw1)
         parsed = stage1_to_predicted_errors(stage1_text, hyp)
 
-        prompt2 = build_stage2_prompt(src, hyp, stage1_text, cfg, domain)
+        prompt2 = build_stage2_prompt(src, hyp, stage1_text, cfg, domain, ref_text=ref_text, ref_type=ref_type)
         messages2 = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt2}]
         print("STAGE 2 PROMPT:")
         print(prompt2)
@@ -357,10 +368,11 @@ def main():
 
     thinking_tag = "_thinking" if args.thinking else ""
     model_tag = f"{args.model}{thinking_tag}"
+    ref_tag = "_ref" if args.with_ref else ""
     shard_tag = f"_s{args.shard}of{args.num_shards}" if args.num_shards > 1 else ""
 
     for pair, cfg in active_pairs.items():
-        output_path = output_dir / f"pred_{model_tag}_{pair}{shard_tag}.jsonl"
+        output_path = output_dir / f"pred_{model_tag}_{pair}{ref_tag}{shard_tag}.jsonl"
         instances = instances_by_pair.get(pair, [])
 
         if args.num_shards > 1:
@@ -369,7 +381,7 @@ def main():
         done_rows: dict = {}
         if args.resume:
             done_rows = load_done_rows(output_path)
-            base_path = output_dir / f"pred_{model_tag}_{pair}.jsonl"
+            base_path = output_dir / f"pred_{model_tag}_{pair}{ref_tag}.jsonl"
             if args.num_shards > 1 and base_path.exists():
                 for iid, row in load_done_rows(base_path).items():
                     if iid not in done_rows:
@@ -415,11 +427,18 @@ def main():
             if flat:
                 domains = [get_domain(chunk[i][0]["doc_id"]) for i, _, _ in flat]
                 srcs = [chunk[i][0]["src_text"] for i, _, _ in flat]
+                refs = [
+                    (chunk[i][0].get("refA") if args.with_ref else None,
+                     chunk[i][0].get("ref_type") if args.with_ref else None)
+                    for i, _, _ in flat
+                ]
 
                 s1_msgs = [
                     [{"role": "system", "content": SYSTEM_PROMPT},
-                     {"role": "user", "content": build_stage1_prompt(src, hyp, cfg, domain)}]
-                    for (i, system, hyp), src, domain in zip(flat, srcs, domains)
+                     {"role": "user", "content": build_stage1_prompt(
+                         src, hyp, cfg, domain, ref_text=ref_text, ref_type=ref_type)}]
+                    for (i, system, hyp), src, domain, (ref_text, ref_type)
+                    in zip(flat, srcs, domains, refs)
                 ]
                 try:
                     s1_outputs = wrapper.generate_batch(s1_msgs, max_new_tokens_s1)
@@ -438,8 +457,10 @@ def main():
 
                     s2_msgs = [
                         [{"role": "system", "content": SYSTEM_PROMPT},
-                         {"role": "user", "content": build_stage2_prompt(src, hyp, s1_text, cfg, domain)}]
-                        for (i, system, hyp), src, domain, s1_text in zip(flat, srcs, domains, s1_texts)
+                         {"role": "user", "content": build_stage2_prompt(
+                             src, hyp, s1_text, cfg, domain, ref_text=ref_text, ref_type=ref_type)}]
+                        for (i, system, hyp), src, domain, s1_text, (ref_text, ref_type)
+                        in zip(flat, srcs, domains, s1_texts, refs)
                     ]
                     try:
                         s2_outputs = wrapper.generate_batch(s2_msgs, MAX_NEW_TOKENS_STAGE2, enable_thinking=False)

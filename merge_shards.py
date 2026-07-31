@@ -132,7 +132,7 @@ def collect_shard_rows(pairs: list[str], model: str, num_shards: int) -> tuple[d
     missing_shards: list[str] = []
 
     for pair in pairs:
-        base_file = OUTPUT_DIR / f"pred_{model}_{pair}.jsonl"
+        base_file = OUTPUT_DIR / f"pred_{model}_{pair}_ref.jsonl"
 
         if num_shards > 1:
             pair_has_shards = False
