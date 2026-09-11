@@ -1,1 +1,40 @@
 __pycache__
+log*/
+*_outputs_*/
+prompts.txt
+*.json
+*.jsonl
+
+# Analysis / correction scripts (not needed to reproduce baselines)
+null_analysis/
+fill_null_scores.py
+fill_empty_hyps.py
+append_missing_challenge.py
+append_missing_xcomet.py
+dedup_task1_errors.py
+convert_output_format.py
+collect_baseline_stats.py
+analyze_task1.py
+analyze_warnings.py
+audit_predictions.py
+check_logs.sh
+temp_null_fill.sh
+
+# Superseded run scripts
+run_qe_local.py
+run_qe_openai.py
+
+# Old SLURM scripts (replaced by run_gemma4.sh / run_qwen36.sh / run_xcomet.sh)
+slurm/run_qe_local.sh
+slurm/run_qe_local_h200.sh
+slurm/run_qe_local_qwen.sh
+slurm/run_qe_local_a100_sharded.sh
+slurm/run_qe_local_sharded_qwen36.sh
+slurm/run_qe_local_sharded_gemma4.sh
+slurm/run_reasoning_qe_local_sharded_qwen36.sh
+slurm/run_reasoning_qe_local_sharded_gemma4.sh
+slurm/run_reasoning_qe_ref_all.sh
+slurm/run_qe_ref_all.sh
+slurm/run_qe_noref_challenge.sh
+slurm/run_missing_challenge.sh
+slurm/run_qe_xcomet.sh

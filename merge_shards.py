@@ -15,10 +15,10 @@ Note: when THINKING=true the model tag includes a _thinking suffix
 (e.g. qwen36_thinking), so pass --model qwen36_thinking accordingly.
 
 Usage (from WMT26-QE-baselines/):
-    python merge_shards.py --model qwen36_thinking --segment-type official
-    python merge_shards.py --model qwen36_thinking --segment-type challenge
-    python merge_shards.py --model gemma4_thinking --pair cs-de --segment-type official
-    python merge_shards.py --dry-run                # check only, no merge
+    python merge_shards.py --model gemma4 --output-dir quality_estimation_outputs_gemma4_no_ref
+    python merge_shards.py --model gemma4_thinking --output-dir quality_estimation_outputs_gemma4_thinking_ref
+    python merge_shards.py --model gemma4 --output-dir quality_estimation_outputs_gemma4_no_ref --pair cs-de
+    python merge_shards.py --model gemma4 --output-dir quality_estimation_outputs_gemma4_no_ref --dry-run
 """
 
 import argparse
@@ -32,14 +32,16 @@ OFFICIAL_PAIRS = [
     "en-se", "en-th", "en-uk", "en-zhcn", "en-zhtw", "zhcn-ja",
 ]
 
-# Challenge sets — 12 pairs (includes en-ja and en-ko, absent from official).
+# Challenge sets — 18 pairs.
+# Original 12 + cs-vi, en-et (were in TARGET_PAIRS but missed as challenge),
+# and en-el, en-hi, ja-zh, zh-en (challenge-only pairs added to TARGET_PAIRS).
 CHALLENGE_PAIRS = [
-    "cs-de", "cs-uk", "en-areg", "en-cs", "en-de", "en-is", "en-ja", "en-ko",
-    "en-ru", "en-uk", "en-zhcn", "zhcn-ja",
+    "cs-de", "cs-uk", "cs-vi", "en-areg", "en-cs", "en-de", "en-el", "en-et",
+    "en-hi", "en-is", "en-ja", "en-ko", "en-ru", "en-uk", "en-zhcn",
+    "ja-zh", "zh-en", "zhcn-ja",
 ]
 
 SCRIPT_DIR = Path(__file__).parent
-OUTPUT_DIR = SCRIPT_DIR / "quality_estimation_outputs_local"
 
 
 def get_source_ids(data_file: Path, pairs: list[str], segment_type: str) -> list[str]:
@@ -121,7 +123,8 @@ def dedup_rows(rows: list[dict]) -> dict[str, dict]:
     return best
 
 
-def collect_shard_rows(pairs: list[str], model: str, num_shards: int) -> tuple[dict, list[str]]:
+def collect_shard_rows(pairs: list[str], model: str, num_shards: int,
+                       output_dir: Path) -> tuple[dict, list[str]]:
     """Collect and deduplicate rows from all shard files across all pairs.
 
     Returns (deduped_dict, list_of_missing_shard_filenames).
@@ -132,12 +135,12 @@ def collect_shard_rows(pairs: list[str], model: str, num_shards: int) -> tuple[d
     missing_shards: list[str] = []
 
     for pair in pairs:
-        base_file = OUTPUT_DIR / f"pred_{model}_{pair}_ref.jsonl"
+        base_file = output_dir / f"pred_{model}_{pair}.jsonl"
 
         if num_shards > 1:
             pair_has_shards = False
             for i in range(num_shards):
-                sf = OUTPUT_DIR / f"pred_{model}_{pair}_s{i}of{num_shards}.jsonl"
+                sf = output_dir / f"pred_{model}_{pair}_s{i}of{num_shards}.jsonl"
                 if sf.exists():
                     all_rows.extend(read_rows(sf))
                     pair_has_shards = True
@@ -162,9 +165,10 @@ def collect_shard_rows(pairs: list[str], model: str, num_shards: int) -> tuple[d
 
 
 def verify_and_merge(pairs: list[str], model: str, num_shards: int,
-                     data_file: Path, segment_type: str, dry_run: bool) -> bool:
+                     data_file: Path, segment_type: str, dry_run: bool,
+                     output_dir: Path) -> bool:
     """Collect all shard rows, verify completeness, and write a single merged output file."""
-    deduped, missing_shards = collect_shard_rows(pairs, model, num_shards)
+    deduped, missing_shards = collect_shard_rows(pairs, model, num_shards, output_dir)
 
     expected_ids = get_source_ids(data_file, pairs, segment_type)
     expected_set = set(expected_ids)
@@ -200,7 +204,7 @@ def verify_and_merge(pairs: list[str], model: str, num_shards: int,
         return True
 
     seg_tag = f"_{segment_type}" if segment_type != "all" else ""
-    out_path = OUTPUT_DIR / f"pred_{model}{seg_tag}.jsonl"
+    out_path = output_dir / f"pred_{model}{seg_tag}.jsonl"
     with open(out_path, "w", encoding="utf-8") as out:
         written = 0
         for iid in expected_ids:
@@ -216,8 +220,11 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="gemma4", help="Model tag (default: gemma4). "
                    "Include _thinking suffix if the run used --thinking (e.g. qwen36_thinking).")
-    p.add_argument("--num-shards", type=int, default=4, help="Number of shards (default: 4). "
-                   "Use 1 for unsharded (challenge) runs.")
+    p.add_argument("--output-dir", required=True,
+                   help="Directory containing the shard files to merge "
+                        "(e.g. quality_estimation_outputs_gemma4_no_ref).")
+    p.add_argument("--num-shards", type=int, default=1, help="Number of shards (default: 1). "
+                   "Set > 1 only if the run used --num-shards sharding.")
     p.add_argument("--pair", default=None, help="Single pair to process (default: all)")
     p.add_argument("--data-file", default=None,
                    help="Path to combined source JSONL (default: mteval-test26.jsonl next to script)")
@@ -242,11 +249,14 @@ def main():
                 seen.add(p_)
 
     data_file = Path(args.data_file) if args.data_file else SCRIPT_DIR / "mteval-test26.jsonl"
+    output_dir = Path(args.output_dir)
 
     mode = "DRY RUN — " if args.dry_run else ""
-    print(f"{mode}model={args.model}, {len(pairs)} pair(s), segment-type={args.segment_type}\n")
+    print(f"{mode}model={args.model}, output-dir={output_dir}, {len(pairs)} pair(s), "
+          f"segment-type={args.segment_type}\n")
 
-    verify_and_merge(pairs, args.model, args.num_shards, data_file, args.segment_type, args.dry_run)
+    verify_and_merge(pairs, args.model, args.num_shards, data_file, args.segment_type,
+                     args.dry_run, output_dir)
 
 
 if __name__ == "__main__":

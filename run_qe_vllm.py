@@ -67,7 +67,7 @@ MODELS = {
     "qwen36": "Qwen/Qwen3.6-35B-A3B",
 }
 
-DEFAULT_MAX_NEW_TOKENS = 512
+DEFAULT_MAX_NEW_TOKENS = 8192
 DEFAULT_MAX_NEW_TOKENS_THINKING = 8192
 MAX_NEW_TOKENS_STAGE2 = 64
 DEFAULT_CHUNK_SIZE_THINKING = 150
@@ -262,6 +262,12 @@ def parse_args():
              "ref text is absent for a given segment.",
     )
     p.add_argument(
+        "--debug-prompts", action="store_true",
+        help="Print the full prompt and raw response for every Stage 1 and Stage 2 "
+             "call during the main run. Very verbose — intended for debugging parse "
+             "failures (e.g. en-hy Stage 2). Output goes to stdout / SLURM .out log.",
+    )
+    p.add_argument(
         "--num-shards", type=int, default=1,
         help="Total number of shards for parallel array jobs. Default 1 = no sharding.",
     )
@@ -442,6 +448,16 @@ def main():
                 ]
                 try:
                     s1_outputs = wrapper.generate_batch(s1_msgs, max_new_tokens_s1)
+                    if args.debug_prompts:
+                        for (fi, fsys, fhyp), fmsg, fout in zip(flat, s1_msgs, s1_outputs):
+                            doc_id = chunk[fi][0]["doc_id"]
+                            print(f"\n{'='*72}")
+                            print(f"[DEBUG S1] doc_id={doc_id} | system={fsys}")
+                            print(f"--- STAGE 1 PROMPT (user turn) ---")
+                            print(fmsg[-1]["content"])
+                            print(f"--- STAGE 1 RAW RESPONSE ({fout[1]} in / {fout[2]} out tokens) ---")
+                            print(fout[0])
+                            print(f"{'='*72}\n")
                 except Exception as e:
                     if "CUDA error" in str(e):
                         raise
@@ -464,6 +480,16 @@ def main():
                     ]
                     try:
                         s2_outputs = wrapper.generate_batch(s2_msgs, MAX_NEW_TOKENS_STAGE2, enable_thinking=False)
+                        if args.debug_prompts:
+                            for (fi, fsys, fhyp), fmsg, fout in zip(flat, s2_msgs, s2_outputs):
+                                doc_id = chunk[fi][0]["doc_id"]
+                                print(f"\n{'='*72}")
+                                print(f"[DEBUG S2] doc_id={doc_id} | system={fsys}")
+                                print(f"--- STAGE 2 PROMPT (user turn) ---")
+                                print(fmsg[-1]["content"])
+                                print(f"--- STAGE 2 RAW RESPONSE ({fout[1]} in / {fout[2]} out tokens) ---")
+                                print(fout[0])
+                                print(f"{'='*72}\n")
                     except Exception as e:
                         logging.error("[%s] chunk@%d stage2 batch failed: %s", pair, chunk_start, e)
                         s2_outputs = [("", 0, 0)] * len(flat)

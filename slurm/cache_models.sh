@@ -11,14 +11,11 @@
 
 set -euo pipefail
 
-# Use conda's bundled OpenSSL instead of the system FIPS-enforced one.
-# On RHEL9, the system OpenSSL is in FIPS mode and conda's libssl doesn't ship
-# the FIPS integrity module, causing "FATAL FIPS SELFTEST FAILURE" on import.
-export OPENSSL_CONF=/dev/null
-
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate qwen
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+# Use system's FIPS-certified libssl (RHEL9 nodes have kernel FIPS mode enabled).
+export LD_PRELOAD="/lib64/libssl.so.3:/lib64/libcrypto.so.3"
 
 echo "Python: $(which python) ($(python --version))"
 echo "HF cache: $(python -c 'from huggingface_hub import constants; print(constants.HF_HUB_CACHE)')"

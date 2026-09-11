@@ -44,7 +44,7 @@ python run_qe.py --data-file mteval-test26.jsonl --segment-type official --pair 
 
 ---
 
-Supports closed-weight models via the Gemini API (`run_qe.py`) and open-weight models on local GPUs (`run_qe_local.py`). Both scripts share common data loading, prompts, and output formatting via `qe_utils.py`.
+Supports closed-weight models via the Gemini API (`run_qe.py`) and open-weight models on local GPUs via vLLM (`run_qe_vllm.py`). Both scripts share common data loading, prompts, and output formatting via `qe_utils.py`.
 
 ---
 
@@ -143,9 +143,9 @@ Use `--segment-type official` or `--segment-type challenge` to restrict to one s
 
 ---
 
-### Gemma-4 / Qwen3.6 (open-weight, local GPU)
+### Gemma-4 / Qwen3.6 (open-weight, local GPU via vLLM)
 
-**Requirements:** `pip install transformers torch accelerate`
+**Requirements:** `pip install vllm`
 
 Models must be pre-downloaded to the HuggingFace cache before running on compute nodes (which have no internet access). Run once on the login node:
 ```bash
@@ -154,95 +154,151 @@ bash slurm/cache_models.sh
 
 **Test on one segment of one system** (no file written):
 ```bash
-python run_qe_local.py --model gemma4 --data-file mteval-test26.jsonl --test
-python run_qe_local.py --model qwen36 --data-file mteval-test26.jsonl --test
+python run_qe_vllm.py --model gemma4 --data-file mteval-test26.jsonl --test
+python run_qe_vllm.py --model qwen36 --data-file mteval-test26.jsonl --test
 ```
 
-**Single pair (recommended for testing timing):**
+**Single pair** (output written to `--output-dir`):
 ```bash
-python run_qe_local.py --model gemma4 --data-file mteval-test26.jsonl --segment-type official --pair cs-de
+python run_qe_vllm.py --model gemma4 --data-file mteval-test26.jsonl \
+    --segment-type all --pair cs-de --tensor-parallel-size 4 \
+    --output-dir quality_estimation_outputs_gemma4_no_ref
+```
+
+**With thinking mode** (chain-of-thought):
+```bash
+python run_qe_vllm.py --model gemma4 --thinking --max-new-tokens 8192 \
+    --data-file mteval-test26.jsonl --pair cs-de --tensor-parallel-size 4 \
+    --output-dir quality_estimation_outputs_gemma4_thinking_no_ref
+```
+
+**With reference translation:**
+```bash
+python run_qe_vllm.py --model gemma4 --with-ref --data-file mteval-test26.jsonl \
+    --pair cs-de --tensor-parallel-size 4 \
+    --output-dir quality_estimation_outputs_gemma4_ref
 ```
 
 **Resume an interrupted run:**
 ```bash
-python run_qe_local.py --model gemma4 --data-file mteval-test26.jsonl --segment-type official --pair cs-de --resume
+python run_qe_vllm.py --model gemma4 --data-file mteval-test26.jsonl \
+    --pair cs-de --tensor-parallel-size 4 --resume \
+    --output-dir quality_estimation_outputs_gemma4_no_ref
 ```
 
-**With thinking mode** (chain-of-thought, uses more tokens):
-```bash
-python run_qe_local.py --model gemma4 --data-file mteval-test26.jsonl --thinking
-python run_qe_local.py --model qwen36 --data-file mteval-test26.jsonl --thinking --max-new-tokens 8192
-```
+Output files are named `pred_{model}_{pair}.jsonl` (or `pred_{model_thinking}_{pair}.jsonl` with `--thinking`) inside the specified `--output-dir`. Use `--segment-type official`, `challenge`, or `all` (default: `all`).
 
-Output is written to `quality_estimation_outputs_local/pred_{model}_{pair}.jsonl`. Use `--segment-type official` or `--segment-type challenge` to restrict to one segment type (default: `all`).
+**Token budgets:** Stage 1 (error annotation) uses `--max-new-tokens` (default: 512 without thinking, 8192 with). Stage 2 (scoring) always uses 64 tokens.
 
-**Token budgets:** Stage 1 (error annotation) uses `--max-new-tokens` (default 512). Stage 2 (scoring) always uses a fixed budget of 64 tokens since it only outputs a number.
+**GPU memory (bf16):**
+- `gemma4` (~62 GB): 4× A100-80G or 2× H200
+- `qwen36` (~70 GB): 4× A100-80G or 2× B200/H200
 
-GPU memory (bf16):
-- `gemma4` (~62 GB): 1× H200 / A100-80G / H100-80G
-- `qwen36` (~70 GB): 1× H200 (141 GB SXM), or 2× A100-80G / H100-80G
+> **Note on en-hy:** English→Armenian segments are unusually long and can exhaust the default context window. Use `--max-model-len 32768 --chunk-size 50` for this pair (the SLURM scripts handle this automatically).
+
+> **Note on deduplication:** Deduplication of hypotheses between Stage 1 and Stage 2 is not performed in this baseline. If your submission pipeline requires it, apply deduplication between the two stages before running Stage 2 scoring.
 
 ---
 
-### SLURM job array (one H200 per language pair)
+### OpenAI Batch API (GPT)
 
-Edit the configuration block at the top of `slurm/run_qe_local.sh` (model, thinking flag, token budget), then submit:
+**Requirements:** `pip install -U openai`
 
 ```bash
-sbatch slurm/run_qe_local.sh
+export OPENAI_API_KEY="your_key_here"
 ```
 
-This launches 23 jobs in parallel (`--array=0-22`), one per language pair, each on a single H200. Logs are written to `slurm/logs/qe_local_{jobid}_{arrayid}.out/err`.
+Set `MODEL_ID` and `REASONING_EFFORT` near the top of `run_qe_openai_batch.py`, then:
 
-To test a single pair before committing to the full array:
 ```bash
-sbatch --array=0 slurm/run_qe_local.sh   # runs cs-de (index 0)
+# Full run (all pairs, all segments)
+python run_qe_openai_batch.py --data-file mteval-test26.jsonl
+
+# Single pair test
+python run_qe_openai_batch.py --data-file mteval-test26.jsonl --pair en-de --max-segments 5
+
+# Resume after interruption
+python run_qe_openai_batch.py --data-file mteval-test26.jsonl --resume
 ```
 
-All jobs use `--resume`, so re-submitting the array after a failure or cancellation only processes segments not yet written.
+The script submits Stage 1 requests as an OpenAI batch job, polls until complete, then submits Stage 2. Intermediate state (`batch_state`, `stage1_lookup`, `stage1_parsed`, `stage2_lookup`) is saved to `OUTPUT_DIR` so any interruption is safely resumable. Final output is `pred_{MODEL_ID}.jsonl` in the same directory.
 
 ---
 
-### Sharded SLURM job array (A100s, faster)
+### XCOMET (metric model)
 
-`slurm/run_qe_local_sharded_qwen36.sh` (and the equivalent gemma4 script) splits each language pair into 4 shards processed in parallel, targeting ~12 h wall time instead of 36–48 h. With 21 pairs × 4 shards = 84 jobs:
+**Requirements:** `pip install unbabel-comet`
 
+Pre-download models before going offline:
 ```bash
-sbatch slurm/run_qe_local_sharded_qwen36.sh
+python -c "from comet import download_model; \
+    download_model('Unbabel/XCOMET-XL'); \
+    download_model('Unbabel/XCOMET-XXL')"
 ```
 
-Shard output files are named `pred_qwen36_{pair}_s0of4.jsonl` through `pred_qwen36_{pair}_s3of4.jsonl`. After all jobs complete, merge all pairs into a single output file in source order:
-
 ```bash
-python merge_shards.py --model qwen36 --segment-type official          # all 21 pairs
-python merge_shards.py --model qwen36 --segment-type official --dry-run  # check only
-python merge_shards.py --model qwen36 --pair en-de                     # single pair
+# XL, no reference, single pair
+python run_qe_xcomet.py --model xl --data-file mteval-test26.jsonl --pair cs-de
+
+# XXL, with reference
+python run_qe_xcomet.py --model xxl --with-ref --data-file mteval-test26.jsonl
+
+# Resume
+python run_qe_xcomet.py --model xl --data-file mteval-test26.jsonl --resume
 ```
 
-`merge_shards.py` collects rows from all shard files across all pairs, deduplicates by `item_id` (preferring scored rows over null-score rows from crashed jobs), and writes a single merged file `pred_{model}.jsonl` in the same order as the source data file.
-
-**Resume behaviour:** `--resume` is always active. When re-running after a partial run or when new hypothesis systems are added to the data, each shard only processes segments/systems not yet scored — existing results are merged in before writing.
+Output is written to `quality_estimation_outputs_xcomet/pred_xcomet_{model}_{pair}{_ref}.jsonl`.
 
 ---
 
-### Diagnosing job failures
+### SLURM job arrays
 
-**Check which array tasks failed or are still running:**
+Three consolidated scripts cover all model families. Each script uses a 108-job array (27 language pairs × 4 variants) so all configurations submit in a single `sbatch` call:
+
+**Gemma-4 (`slurm/run_gemma4.sh`)**
+
+| Variant | IDs | Thinking | Reference | Output directory |
+|---------|-----|----------|-----------|-----------------|
+| 0 | 0–26 | no | no | `quality_estimation_outputs_gemma4_no_ref` |
+| 1 | 27–53 | no | yes | `quality_estimation_outputs_gemma4_ref` |
+| 2 | 54–80 | yes | no | `quality_estimation_outputs_gemma4_thinking_no_ref` |
+| 3 | 81–107 | yes | yes | `quality_estimation_outputs_gemma4_thinking_ref` |
+
 ```bash
-bash check_logs.sh                          # gemma4 shards (default)
-bash check_logs.sh slurm/logs qe_qwen_shard # different pattern
+sbatch slurm/run_gemma4.sh                   # all 108 jobs
+sbatch --array=0 slurm/run_gemma4.sh         # smoke-test: cs-de, no-thinking, no-ref
+sbatch --array=0-53 slurm/run_gemma4.sh      # no-thinking variants only
+sbatch --array=54-107 slurm/run_gemma4.sh    # thinking variants only
 ```
 
-Outputs succeeded/failed/unknown counts, failure reasons, and a ready-to-paste `sbatch --array=...` resubmit command for failed tasks.
+**Qwen3.6 (`slurm/run_qwen36.sh`)** — identical variant layout, same commands with `run_qwen36.sh`.
 
-**Analyze warning counts by language pair:**
+**XCOMET (`slurm/run_xcomet.sh`)**
+
+| Variant | IDs | Model | Reference |
+|---------|-----|-------|-----------|
+| 0 | 0–26 | XL | no |
+| 1 | 27–53 | XL | yes |
+| 2 | 54–80 | XXL | no |
+| 3 | 81–107 | XXL | yes |
+
 ```bash
-python analyze_warnings.py                  # all pairs, sorted by total warnings
-python analyze_warnings.py --top 10         # worst 10 pairs
-python analyze_warnings.py --pattern qe_qwen_shard
+sbatch slurm/run_xcomet.sh                   # all 108 jobs
+sbatch --array=0-53 slurm/run_xcomet.sh      # XL only
 ```
 
-Reports Stage 1 warnings (span not found in hypothesis) and Stage 2 warnings (failed to parse score) per pair, deduplicated to avoid counting crash-resume reruns twice.
+**After Gemma/Qwen jobs complete**, merge each variant's per-pair files into one:
+```bash
+python merge_shards.py --model gemma4 \
+    --output-dir quality_estimation_outputs_gemma4_no_ref
+python merge_shards.py --model gemma4_thinking \
+    --output-dir quality_estimation_outputs_gemma4_thinking_no_ref
+# (repeat for ref and qwen36 variants)
+```
+
+`merge_shards.py` deduplicates by `item_id` (preferring scored rows over null-score rows from crashed jobs) and writes a single `pred_{model}.jsonl` in source order.
+
+**Resume behaviour:** `--resume` is always active. Re-submitting a failed array only processes segments not yet written to disk.
 
 ---
 
@@ -257,12 +313,14 @@ Key settings in `qe_utils.py`:
 | `TARGET_PAIRS` | 21 pairs | Language pairs and their FLORES-200 codes |
 | `DOMAIN_REQUIREMENTS` | 7 domains | Per-domain prompt text for Stage 1 and Stage 2 (news, factchecking, speech, social, software, edu, general) |
 
-Key settings in `run_qe_local.py`:
+Key settings in `run_qe_vllm.py`:
 
 | Variable | Default | Description |
 |---|---|---|
 | `DEFAULT_MAX_NEW_TOKENS` | `512` | Stage 1 token budget without thinking |
 | `DEFAULT_MAX_NEW_TOKENS_THINKING` | `8192` | Stage 1 token budget with `--thinking` |
 | `MAX_NEW_TOKENS_STAGE2` | `64` | Stage 2 token budget (hardcoded; just a number) |
+| `DEFAULT_CHUNK_SIZE_NON_THINKING` | `400` | Segments per vLLM call without thinking |
+| `DEFAULT_CHUNK_SIZE_THINKING` | `150` | Segments per vLLM call with thinking |
 
 ---

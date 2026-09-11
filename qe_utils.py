@@ -181,17 +181,25 @@ TARGET_PAIRS = {
     "en-zhcn": {"src_name": "English",            "tgt_name": "Simplified Chinese",  "src_code": "eng_Latn", "tgt_code": "zho_Hans"},
     "en-zhtw": {"src_name": "English",            "tgt_name": "Traditional Chinese", "src_code": "eng_Latn", "tgt_code": "zho_Hant_TW"},
     "zhcn-ja": {"src_name": "Simplified Chinese", "tgt_name": "Japanese",            "src_code": "zho_Hans", "tgt_code": "jpn_Jpan"},
+    # Challenge-only pairs (no official WMT26 equivalent)
+    "en-el":   {"src_name": "English",            "tgt_name": "Greek",               "src_code": "eng_Latn", "tgt_code": "ell_Grek"},
+    "en-hi":   {"src_name": "English",            "tgt_name": "Hindi",               "src_code": "eng_Latn", "tgt_code": "hin_Deva"},
+    "ja-zh":   {"src_name": "Japanese",           "tgt_name": "Simplified Chinese",  "src_code": "jpn_Jpan", "tgt_code": "zho_Hans"},
+    "zh-en":   {"src_name": "Simplified Chinese", "tgt_name": "English",             "src_code": "zho_Hans", "tgt_code": "eng_Latn"},
 }
 
-# Challenge segments use short 2-letter language codes instead of FLORES-200 codes.
-# Maps (short_src, short_tgt) -> TARGET_PAIRS key. Pairs with no official equivalent are omitted.
+# Challenge segments use short 2-letter codes OR FLORES-200 codes instead of a single standard.
+# Maps (src_code, tgt_code) -> TARGET_PAIRS key.
 CHALLENGE_CODE_MAP = {
+    # Short 2-letter codes (most challenge segments)
     ("cs", "de"):    "cs-de",
     ("cs", "uk"):    "cs-uk",
     ("en", "ar"):    "en-areg",
     ("en", "cs"):    "en-cs",
     ("en", "de"):    "en-de",
     ("en", "de_DE"): "en-de",
+    ("en", "el"):    "en-el",
+    ("en", "hi"):    "en-hi",
     ("en", "is"):    "en-is",
     ("en", "ja"):    "en-ja",
     ("en", "ja_JP"): "en-ja",
@@ -200,7 +208,16 @@ CHALLENGE_CODE_MAP = {
     ("en", "uk"):    "en-uk",
     ("en", "zh"):    "en-zhcn",
     ("en", "zh_CN"): "en-zhcn",
+    ("ja", "zh"):    "ja-zh",
+    ("zh", "en"):    "zh-en",
     ("zh", "ja"):    "zhcn-ja",
+    # FLORES-200 code variants (a subset of challenge segments use these)
+    ("ces_Latn", "deu_Latn"): "cs-de",
+    ("ces_Latn", "vie_Latn"): "cs-vi",
+    ("eng_Latn", "deu_Latn"): "en-de",
+    ("eng_Latn", "ekk_Latn"): "en-et",
+    ("eng_Latn", "isl_Latn"): "en-is",
+    ("zho_Hans", "jpn_Jpan"): "zhcn-ja",
 }
 
 
